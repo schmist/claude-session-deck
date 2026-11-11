@@ -4,7 +4,13 @@ Shows every running [Claude Code](https://claude.com/claude-code) session on an
 Elgato Stream Deck: one key per session, with its live state. Pressing a key
 jumps to the window that session runs in.
 
-![Example keys: five sessions and the usage key](docs/preview.png)
+![Rendering of a Stream Deck with eight example sessions and the usage key](docs/preview.png)
+
+*Rendering with example sessions; the keys are drawn by the daemon's own code.*
+
+> **Work in progress.** This currently only works with the one deck it was
+> developed on, an Elgato Stream Deck MK.2 (15 keys, USB ID `0fd9:0080`).
+> Other models are not supported.
 
 Not affiliated with Anthropic or Elgato.
 
@@ -37,7 +43,7 @@ while a session is active; for accounts without such limits the key reads
 ## Requirements
 
 - Linux with systemd user services
-- A 15-key Stream Deck: MK.2 or original V2
+- A Stream Deck MK.2; the original V2 uses the same protocol but is untested
 - Python 3.8+ with Pillow
 - To jump to windows: a supported desktop, see [Jumping to a window](#jumping-to-a-window)
 - Optional: the Ubuntu font; the fallback font is wider, so more text gets shortened
