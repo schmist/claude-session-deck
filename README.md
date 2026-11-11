@@ -1,4 +1,4 @@
-# claude-deck
+# claude-session-deck
 
 Shows every running [Claude Code](https://claude.com/claude-code) session on an
 Elgato Stream Deck: one key per session, with its live state. Pressing a key
@@ -51,7 +51,7 @@ while a session is active; for accounts without such limits the key reads
 Developed on Ubuntu with GNOME Shell 50 on Wayland and a Stream Deck MK.2;
 other setups are untested.
 
-Do not run other Stream Deck software at the same time: claude-deck takes over
+Do not run other Stream Deck software at the same time: claude-session-deck takes over
 all keys.
 
 ## Install
@@ -75,10 +75,10 @@ counts as no. Everything else is installed for the current user only:
 
 | What | Where |
 |---|---|
-| Daemon | `~/.local/share/claude-deck/claude_deck.py` |
-| Service | `~/.config/systemd/user/claude-deck.service` |
-| Status line script and its data | `~/.claude/claude-deck/` |
-| Bundled GNOME extension, if Window Calls is not used | `~/.local/share/gnome-shell/extensions/claude-deck-windows@local/` |
+| Daemon | `~/.local/share/claude-session-deck/claude_session_deck.py` |
+| Service | `~/.config/systemd/user/claude-session-deck.service` |
+| Status line script and its data | `~/.claude/claude-session-deck/` |
+| Bundled GNOME extension, if Window Calls is not used | `~/.local/share/gnome-shell/extensions/claude-session-deck-windows@local/` |
 
 To update, pull and run `./install.sh` again. To remove, run `./uninstall.sh`.
 
@@ -86,7 +86,7 @@ To update, pull and run `./install.sh` again. To remove, run `./uninstall.sh`.
 [Window Calls](https://extensions.gnome.org/extension/4724/window-calls/), which
 loads right away. If you decline, it installs a small bundled extension, which
 GNOME only loads at login: log out and back in, then run
-`gnome-extensions enable claude-deck-windows@local`. Until then, pressing a key
+`gnome-extensions enable claude-session-deck-windows@local`. Until then, pressing a key
 does nothing.
 
 **Device access.** Your user must be allowed to write to the deck's
@@ -94,7 +94,7 @@ does nothing.
 offers the udev rule. To install it by hand:
 
 ```sh
-sudo cp udev/70-claude-deck.rules /etc/udev/rules.d/
+sudo cp udev/70-claude-session-deck.rules /etc/udev/rules.d/
 sudo udevadm control --reload
 sudo udevadm trigger --subsystem-match=hidraw
 ```
@@ -106,13 +106,13 @@ sudo udevadm trigger --subsystem-match=hidraw
 reads these four times a second and drops sessions whose process is gone. The
 tool name and context size come from the end of the session's transcript in
 `~/.claude/projects/`. These files are internal to Claude Code, so an update
-can break claude-deck.
+can break claude-session-deck.
 
 **Account usage.** Claude Code passes the account's usage limits to its status
 line command. The installer registers `statusline.sh` as that command; it
 saves the data for the daemon and then runs the status line you had before, if
 any. The uninstaller restores the previous setting, and a copy of your earlier
-settings is kept in `~/.claude/claude-deck/settings.json.before-claude-deck`.
+settings is kept in `~/.claude/claude-session-deck/settings.json.before-claude-session-deck`.
 
 **Sessions in Docker** are shown if the container mounts the host's
 `~/.claude` and runs as your user. They all have process ID 1 and so share one
@@ -132,7 +132,7 @@ key presses from it, without a Stream Deck library.
 
 ## Jumping to a window
 
-Linux has no single way to focus another program's window, so claude-deck uses
+Linux has no single way to focus another program's window, so claude-session-deck uses
 the first of these mechanisms that sees any windows:
 
 | Desktop | Mechanism | Needs |
@@ -162,7 +162,7 @@ third-party project, can also move, resize and close them.
 
 1. The window that had the focus when the session started or last got a
    prompt, if it belongs to the session's terminal or IDE. This is remembered
-   in `~/.cache/claude-deck/windows.json`.
+   in `~/.cache/claude-session-deck/windows.json`.
 2. Otherwise a window owned by a parent process of the session, preferring one
    with the project folder name in its title.
 
@@ -177,7 +177,7 @@ Limits:
 
 ## Configuration
 
-The settings are constants at the top of `claude_deck.py`; change them and run
+The settings are constants at the top of `claude_session_deck.py`; change them and run
 `./install.sh` again.
 
 | Constant | Default | Meaning |
@@ -192,15 +192,15 @@ The settings are constants at the top of `claude_deck.py`; change them and run
 | `FONT` | Ubuntu variable font | Font file used for all text |
 
 To see how much your keycaps hide, stop the service and run
-`python3 claude_deck.py --calibrate`. Every key shows nested frames, each
+`python3 claude_session_deck.py --calibrate`. Every key shows nested frames, each
 3 pixels wide: white outermost, then red, yellow, green, blue. The outermost
 colour visible on a side tells how much is hidden there.
 
 ## Troubleshooting
 
 ```sh
-systemctl --user status claude-deck     # is it running?
-journalctl --user -u claude-deck -f     # log
+systemctl --user status claude-session-deck     # is it running?
+journalctl --user -u claude-session-deck -f     # log
 ```
 
 | Symptom | Cause and fix |
@@ -208,7 +208,7 @@ journalctl --user -u claude-deck -f     # log
 | Deck stays dark, log shows `Permission denied` | No access to the device: see Device access under [Install](#install) |
 | Deck stays dark, nothing in the log | No supported deck found: check `lsusb` for vendor `0fd9`; only 15-key models are supported |
 | Keys flicker or show other content | Another Stream Deck program is running; stop it |
-| Pressing a key does nothing, log shows both extensions as `not loaded` | Install Window Calls, or log out and in and run `gnome-extensions enable claude-deck-windows@local` |
+| Pressing a key does nothing, log shows both extensions as `not loaded` | Install Window Calls, or log out and in and run `gnome-extensions enable claude-session-deck-windows@local` |
 | Log shows `no window found for …` | The line lists each mechanism tried; none applies to your desktop, or no window matches the session |
 | Usage key reads `no data yet` | The status line command is not set up (run `./install.sh` again), no session has been active since, or the account has no usage limits |
 | A session is missing | It is not interactive, or its container does not share `~/.claude` |

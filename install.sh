@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Install claude-deck for the current user. Safe to run again to update.
+# Install claude-session-deck for the current user. Safe to run again to update.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-app_dir="$HOME/.local/share/claude-deck"
+app_dir="$HOME/.local/share/claude-session-deck"
 unit_dir="$HOME/.config/systemd/user"
-ext_uuid="claude-deck-windows@local"
+ext_uuid="claude-session-deck-windows@local"
 ext_dir="$HOME/.local/share/gnome-shell/extensions/$ext_uuid"
 
 info() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
@@ -91,8 +91,8 @@ fi
 
 # --- files -------------------------------------------------------------------
 info "Installing the daemon to $app_dir"
-install -Dm755 "$here/claude_deck.py" "$app_dir/claude_deck.py"
-install -Dm644 "$here/systemd/claude-deck.service" "$unit_dir/claude-deck.service"
+install -Dm755 "$here/claude_session_deck.py" "$app_dir/claude_session_deck.py"
+install -Dm644 "$here/systemd/claude-session-deck.service" "$unit_dir/claude-session-deck.service"
 
 # --- GNOME: an extension is needed to focus windows ---------------------------
 # "Window Calls" is preferred: GNOME loads it right away, the bundled one only at login.
@@ -129,14 +129,14 @@ fi
 
 # --- account usage: Claude Code status line ----------------------------------
 # statusline.sh saves the usage limits Claude Code passes to its status line command.
-hook_dir="$HOME/.claude/claude-deck"
+hook_dir="$HOME/.claude/claude-session-deck"
 install -Dm755 "$here/statusline.sh" "$hook_dir/statusline.sh"
 # status_line_setup check|apply: prints configured, add, replace or unreadable
 status_line_setup() {
     python3 - "$HOME/.claude/settings.json" "$hook_dir" "$1" <<'PY'
 import json, os, sys
 path, hook_dir, mode = sys.argv[1:4]
-ours = "~/.claude/claude-deck/statusline.sh"
+ours = "~/.claude/claude-session-deck/statusline.sh"
 try:
     settings = json.load(open(path))
 except FileNotFoundError:
@@ -149,7 +149,7 @@ if current == ours:
 if mode == "check":
     print("replace" if current else "add"); sys.exit()
 if os.path.exists(path):
-    with open(os.path.join(hook_dir, "settings.json.before-claude-deck"), "w") as backup:
+    with open(os.path.join(hook_dir, "settings.json.before-claude-session-deck"), "w") as backup:
         backup.write(open(path).read())
 if current:  # keep the existing status line working behind ours
     with open(os.path.join(hook_dir, "statusline-original"), "w") as original:
@@ -193,7 +193,7 @@ if [ -z "$deck" ]; then
 elif [ ! -w "$deck" ]; then
     warn "$deck is not writable by $USER"
     if ask "Install a udev rule to grant access (uses sudo)?"; then
-        sudo install -m644 "$here/udev/70-claude-deck.rules" /etc/udev/rules.d/70-claude-deck.rules
+        sudo install -m644 "$here/udev/70-claude-session-deck.rules" /etc/udev/rules.d/70-claude-session-deck.rules
         sudo udevadm control --reload
         sudo udevadm trigger --subsystem-match=hidraw
         info "udev rule installed"
@@ -205,11 +205,11 @@ fi
 # --- service -----------------------------------------------------------------
 info "Starting the service"
 systemctl --user daemon-reload
-systemctl --user enable claude-deck.service >/dev/null
-systemctl --user restart claude-deck.service
+systemctl --user enable claude-session-deck.service >/dev/null
+systemctl --user restart claude-session-deck.service
 
 echo
-info "Done. Logs: journalctl --user -u claude-deck -f"
+info "Done. Logs: journalctl --user -u claude-session-deck -f"
 case "$extension" in
     pending)
         echo "    Window Calls is not installed, so the bundled extension is used. One step"

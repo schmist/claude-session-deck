@@ -1,0 +1,6 @@
+{
+  "uuid": "claude-session-deck-windows@local",
+  "name": "Claude Session Deck Windows",
+  "description": "Lets the claude-session-deck Stream Deck daemon list and focus windows over D-Bus.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"]
+}

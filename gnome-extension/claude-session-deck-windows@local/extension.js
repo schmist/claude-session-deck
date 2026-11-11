@@ -4,7 +4,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const IFACE = `
 <node>
-  <interface name="ch.claudedeck.Windows">
+  <interface name="ch.claudesessiondeck.Windows">
     <method name="List"><arg type="s" direction="out"/></method>
     <method name="Activate">
       <arg type="u" direction="in"/>
@@ -13,10 +13,10 @@ const IFACE = `
   </interface>
 </node>`;
 
-export default class ClaudeDeckWindows extends Extension {
+export default class ClaudeSessionDeckWindows extends Extension {
     enable() {
         this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE, this);
-        this._dbus.export(Gio.DBus.session, '/ch/claudedeck/Windows');
+        this._dbus.export(Gio.DBus.session, '/ch/claudesessiondeck/Windows');
     }
 
     disable() {

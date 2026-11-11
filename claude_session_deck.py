@@ -20,8 +20,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
-STATUS_FILE = os.path.expanduser("~/.claude/claude-deck/status.json")   # written by statusline.sh
-WINDOWS_FILE = os.path.expanduser("~/.cache/claude-deck/windows.json")  # see learn_window()
+STATUS_FILE = os.path.expanduser("~/.claude/claude-session-deck/status.json")   # written by statusline.sh
+WINDOWS_FILE = os.path.expanduser("~/.cache/claude-session-deck/windows.json")  # see learn_window()
 ELGATO_VENDOR = 0x0FD9
 PRODUCTS = {0x006D, 0x0080, 0x00A5}  # "Original V2" protocol: 15 keys, 72 px JPEG, rotated 180°
 KEYS, SIZE = 15, 72
@@ -840,8 +840,8 @@ class X11:
 BACKENDS = [
     GnomeShell("window-calls extension", "/org/gnome/Shell/Extensions/Windows",
                "org.gnome.Shell.Extensions.Windows"),
-    GnomeShell("claude-deck-windows extension", "/ch/claudedeck/Windows",
-               "ch.claudedeck.Windows"),
+    GnomeShell("claude-session-deck-windows extension", "/ch/claudesessiondeck/Windows",
+               "ch.claudesessiondeck.Windows"),
     Sway(), Hyprland(), KWin(), X11(),
 ]
 

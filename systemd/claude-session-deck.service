@@ -4,7 +4,7 @@ After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
-ExecStart=/usr/bin/python3 %h/.local/share/claude-deck/claude_deck.py
+ExecStart=/usr/bin/python3 %h/.local/share/claude-session-deck/claude_session_deck.py
 Restart=on-failure
 RestartSec=3
 
