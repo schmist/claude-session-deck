@@ -12,6 +12,7 @@ import os
 import re
 import random
 import select
+import socket
 import subprocess
 import sys
 import time
@@ -22,6 +23,8 @@ SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 STATUS_FILE = os.path.expanduser("~/.claude/claude-session-deck/status.json")   # written by statusline.sh
 WINDOWS_FILE = os.path.expanduser("~/.cache/claude-session-deck/windows.json")  # see learn_window()
+RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
+                           "claude-session-deck")                                # sockets of TOOLS
 ELGATO_VENDOR = 0x0FD9
 PRODUCTS = {0x006D, 0x0080, 0x00A5}  # "Original V2" protocol: 15 keys, 72 px JPEG, rotated 180°
 KEYS, SIZE = 15, 72
@@ -930,25 +933,95 @@ def learn_window(session, live_keys):
         log("cannot save learned windows:", e)
 
 
-def find_window(session):
-    """(backend, window, notes) for the session; window is None if not found."""
+def find_window(session, chain, title=None):
+    """(backend, window, notes) for the session; window is None if not found.
+
+    `title` is the title of the session's window, if its tool reported one."""
     backend, windows, notes = list_windows()
     if backend is None:
         return None, None, notes
+    for window in windows:
+        if title and window.get("title") == title and window.get("pid") in chain:
+            return backend, window, notes
     learned = learned_windows().get(process_key(session))
     if learned and learned["backend"] == backend.name:
         for window in windows:
             if window["id"] == learned["id"]:
                 return backend, window, notes
-    chain = session_chain(session)
     best = max(windows, key=lambda w: window_score(session, chain, w))
     if window_score(session, chain, best) > 0:
         return backend, best, notes
     return None, None, notes
 
 
+# Raising a window works for any terminal or IDE. A tool listed here knows the
+# program a session runs in well enough to do more, such as selecting its tab.
+
+class Tool:
+    """A terminal or IDE that sessions run in. A subclass overrides what it supports."""
+
+    name = "?"
+
+    def runs(self, pid):
+        """Whether the process `pid` is this tool and can be driven right now."""
+        return False
+
+    def focus(self, pid, chain):
+        """Bring the session to the front inside the tool process `pid`.
+
+        `chain` holds the session's parent processes. Returns the title of the
+        window the session is in, if the tool knows it; raises if it fails."""
+        return None
+
+
+class JetBrains(Tool):
+    """IntelliJ-based IDEs, through the plugin in jetbrains-plugin/.
+
+    The plugin listens on a socket named after the IDE's process and selects the
+    terminal tab whose shell is one of the processes it is sent."""
+
+    name = "JetBrains IDE"
+
+    def _socket(self, pid):
+        return os.path.join(RUNTIME_DIR, f"jetbrains-{pid}.sock")
+
+    def runs(self, pid):
+        return os.path.exists(self._socket(pid))
+
+    def focus(self, pid, chain):
+        with socket.socket(socket.AF_UNIX) as conn:
+            conn.settimeout(3)
+            conn.connect(self._socket(pid))
+            conn.sendall(f"focus {' '.join(map(str, chain))}\n".encode())
+            reply = conn.makefile(encoding="utf-8").readline().rstrip("\n")
+        status, _, title = reply.partition("\t")
+        if status != "ok":
+            raise RuntimeError("no terminal tab belongs to the session")
+        return title or None
+
+
+TOOLS = [JetBrains()]
+
+
+def session_tool(chain):
+    """(tool, its pid) for the supported tool the session runs in, else (None, None)."""
+    for pid in chain:
+        for tool in TOOLS:
+            if tool.runs(pid):
+                return tool, pid
+    return None, None
+
+
 def focus(session):
-    backend, window, tried = find_window(session)
+    chain = session_chain(session)
+    tool, pid = session_tool(chain)
+    title = None
+    if tool:
+        try:
+            title = tool.focus(pid, chain)
+        except Exception as e:  # the window is still raised
+            log(f"{tool.name}: cannot focus {label(session)}: {e}")
+    backend, window, tried = find_window(session, chain, title)
     if window is None:
         log(f"no window found for {label(session)} ({'; '.join(tried) or 'no usable backend'})")
         return

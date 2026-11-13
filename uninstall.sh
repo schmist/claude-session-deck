@@ -11,6 +11,7 @@ systemctl --user daemon-reload
 gnome-extensions disable "$ext_uuid" 2>/dev/null
 rm -rf "$HOME/.local/share/gnome-shell/extensions/$ext_uuid"
 rm -rf "$HOME/.local/share/claude-session-deck" "$HOME/.cache/claude-session-deck"
+rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}"/{JetBrains,Google}/*/claude-session-deck  # IDE plugins
 
 # Give Claude Code its previous status line back.
 python3 - "$HOME/.claude/settings.json" "$HOME/.claude/claude-session-deck" <<'PY'

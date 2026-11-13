@@ -2,7 +2,8 @@
 
 Shows every running [Claude Code](https://claude.com/claude-code) session on an
 Elgato Stream Deck: one key per session, with its live state. Pressing a key
-jumps to the window that session runs in.
+jumps to the window that session runs in and, in JetBrains IDEs, to its
+terminal tab.
 
 ![Rendering of a Stream Deck with eight example sessions and the usage key](docs/preview.png)
 
@@ -68,6 +69,7 @@ for packages and the udev rule:
 - missing packages (Pillow, PyGObject on GNOME, `kdotool` on KDE Wayland)
 - the Window Calls extension on GNOME
 - a status line command in `~/.claude/settings.json`, for the usage key
+- a plugin for each JetBrains IDE found, to select the session's terminal tab
 - a udev rule, if the deck is not accessible
 
 `./install.sh --yes` agrees to all of them; without a terminal every question
@@ -79,6 +81,7 @@ counts as no. Everything else is installed for the current user only:
 | Service | `~/.config/systemd/user/claude-session-deck.service` |
 | Status line script and its data | `~/.claude/claude-session-deck/` |
 | Bundled GNOME extension, if Window Calls is not used | `~/.local/share/gnome-shell/extensions/claude-session-deck-windows@local/` |
+| JetBrains plugin | `~/.local/share/JetBrains/<IDE and version>/claude-session-deck/` (Android Studio: under `Google/`) |
 
 To update, pull and run `./install.sh` again. To remove, run `./uninstall.sh`.
 
@@ -160,13 +163,15 @@ third-party project, can also move, resize and close them.
 
 **Which window is chosen:**
 
-1. The window that had the focus when the session started or last got a
+1. The window the session's tool reports, if the tool is
+   [supported](#tools).
+2. The window that had the focus when the session started or last got a
    prompt, if it belongs to the session's terminal or IDE. This is remembered
    in `~/.cache/claude-session-deck/windows.json`.
-2. Otherwise a window owned by a parent process of the session, preferring one
+3. Otherwise a window owned by a parent process of the session, preferring one
    with the project folder name in its title.
 
-Limits:
+Limits, where the session's tool is not supported:
 
 - The window is raised, but the right tab inside it is not selected.
 - Until a session gets a prompt while the daemon runs, several windows of one
@@ -174,6 +179,41 @@ Limits:
 - A session that starts working on its own (a scheduled task, for example) is
   remembered for whichever window of its program has the focus, until your
   next prompt.
+
+## Tools
+
+Raising a window works for any terminal or IDE. For a tool the daemon knows,
+it can do more:
+
+| Tool | Extra | Needs |
+|---|---|---|
+| JetBrains IDEs (IntelliJ IDEA, PyCharm, Android Studio, …) | Selects the session's tab in the Terminal tool window and raises the right project window | The plugin from `jetbrains-plugin/`, the IDE's current terminal (not the Classic one) |
+
+**The JetBrains plugin** is built by `./install.sh` against each IDE it finds
+(running, or installed through Toolbox, in `/opt` or as a snap), using the
+Java compiler the IDE ships, and is loaded when the IDE next starts. A new
+major IDE version has its own plugin directory, so run `./install.sh` again
+after such an update. To build it by hand:
+
+```sh
+jetbrains-plugin/build.sh <IDE home> <plugins directory>
+```
+
+The plugin listens on the socket
+`$XDG_RUNTIME_DIR/claude-session-deck/jetbrains-<IDE process ID>.sock`, which
+only your user can reach. The daemon sends it the session's parent processes;
+the plugin selects the tab whose shell is one of them and replies with the
+title of that project's window. It uses the terminal's programming interface,
+which JetBrains may change between versions; the key then still raises the
+window and the daemon's log says why the tab was not selected.
+
+Developed against IntelliJ IDEA 2026.3; other IDEs are untested. Terminals opened as an editor tab
+are not selected.
+
+**Adding a tool.** A tool is a subclass of `Tool` in `claude_session_deck.py`,
+listed in `TOOLS`. `runs(pid)` tells whether a process is that tool, and is
+asked for each parent process of the session; `focus(pid, chain)` brings the
+session to the front inside it and may return the title of its window.
 
 ## Configuration
 
@@ -210,5 +250,6 @@ journalctl --user -u claude-session-deck -f     # log
 | Keys flicker or show other content | Another Stream Deck program is running; stop it |
 | Pressing a key does nothing, log shows both extensions as `not loaded` | Install Window Calls, or log out and in and run `gnome-extensions enable claude-session-deck-windows@local` |
 | Log shows `no window found for …` | The line lists each mechanism tried; none applies to your desktop, or no window matches the session |
+| The wrong terminal tab stays selected in a JetBrains IDE | The plugin is not loaded: run `./install.sh`, then restart the IDE. If the log shows `JetBrains IDE: cannot focus …`, see the IDE's own log (Help → Show Log) |
 | Usage key reads `no data yet` | The status line command is not set up (run `./install.sh` again), no session has been active since, or the account has no usage limits |
 | A session is missing | It is not interactive, or its container does not share `~/.claude` |

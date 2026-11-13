@@ -21,7 +21,7 @@ for arg in "$@"; do
         -y|--yes) assume_yes=true ;;
         -h|--help)
             echo "usage: ./install.sh [--yes]"
-            echo "  --yes  answer yes to every question (packages, extension, udev rule)"
+            echo "  --yes  answer yes to every question (packages, extension, IDE plugin, udev rule)"
             exit 0 ;;
         *) die "unknown option: $arg" ;;
     esac
@@ -179,6 +179,35 @@ case "$status_line" in
     *)          warn "status line not configured; the usage key will show 'no data yet'" ;;
 esac
 
+# --- JetBrains IDEs: select the session's terminal tab ------------------------
+# The plugin is built against each IDE found, with that IDE's own Java compiler.
+jetbrains_homes() {
+    {
+        for exe in /proc/[0-9]*/exe; do readlink "$exe" 2>/dev/null; done | sed -n 's|/bin/[^/]*$||p'
+        ls -d "$HOME"/.local/share/JetBrains/Toolbox/apps/* /opt/* /snap/*/current 2>/dev/null
+    } | sort -u | while read -r home; do
+        if [ -f "$home/product-info.json" ] && [ -d "$home/plugins/terminal" ]; then echo "$home"; fi
+    done || true
+}
+
+jetbrains_ides=""
+while read -r ide_home <&3; do
+    # Plugins live in <vendor>/<product and version>, e.g. JetBrains/IntelliJIdea2026.3
+    read -r ide_data ide_name < <(python3 -c '
+import json, sys
+info = json.load(open(sys.argv[1]))
+print(info["productVendor"] + "/" + info["dataDirectoryName"], info["name"])' "$ide_home/product-info.json") || continue
+    plugins_dir="${XDG_DATA_HOME:-$HOME/.local/share}/$ide_data"
+    if [ -e "$plugins_dir/claude-session-deck" ] ||
+        ask "Select the session's terminal tab in $ide_name? This builds a plugin and installs it to $plugins_dir"; then
+        if "$here/jetbrains-plugin/build.sh" "$ide_home" "$plugins_dir"; then
+            jetbrains_ides+="${jetbrains_ides:+, }$ide_name"
+        else
+            warn "could not build the plugin for $ide_name; its terminal may be too old"
+        fi
+    fi
+done 3< <(jetbrains_homes)
+
 # --- device access -----------------------------------------------------------
 deck=""
 for dev in /sys/class/hidraw/hidraw*; do
@@ -225,3 +254,7 @@ case "$extension" in
         echo "    Press a key to jump to that session's window."
         ;;
 esac
+if [ -n "$jetbrains_ides" ]; then
+    echo "    The plugin that selects a session's terminal tab is loaded when the IDE"
+    echo "    starts; restart if it was new or updated: $jetbrains_ides"
+fi

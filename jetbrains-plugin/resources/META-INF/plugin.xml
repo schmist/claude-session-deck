@@ -1,0 +1,18 @@
+<idea-plugin>
+  <id>ch.claudesessiondeck.jetbrains</id>
+  <name>Claude Session Deck</name>
+  <version>1</version>
+  <vendor>claude-session-deck</vendor>
+  <description>Lets the claude-session-deck daemon select the terminal tab a Claude Code session
+    runs in, when its Stream Deck key is pressed.</description>
+  <idea-version since-build="262"/>
+  <dependencies>
+    <plugin id="com.intellij.modules.platform"/>
+    <plugin id="org.jetbrains.plugins.terminal"/>
+    <module name="intellij.terminal.frontend"/>
+  </dependencies>
+  <extensions defaultExtensionNs="com.intellij">
+    <applicationService serviceImplementation="ch.claudesessiondeck.jetbrains.TabServer"/>
+    <postStartupActivity implementation="ch.claudesessiondeck.jetbrains.Startup"/>
+  </extensions>
+</idea-plugin>
