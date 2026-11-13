@@ -153,10 +153,18 @@ cd claude-session-deck
 ./install.sh
 ```
 
-The script asks before each step that changes the system, and uses `sudo` only
-for packages and the udev rule:
+The script first checks what claude-session-deck needs on this system and
+lists each thing as found or missing. For what is missing it says what does
+not work without it and which package provides it, and offers to install that
+package. Something required that is still missing ends the installation;
+something optional is named again at the end, with the command that installs
+it. `./install.sh --check` only does this check and changes nothing.
 
-- missing packages (Pillow, PyGObject, `kdotool` on KDE Wayland)
+It asks before each step that changes the system, and uses `sudo` only for
+packages and the udev rule:
+
+- missing packages (Pillow, PyGObject, the AT-SPI bindings if Ptyxis is
+  installed, `kdotool` on KDE Wayland, the Ubuntu font)
 - the Window Calls extension on GNOME
 - a status line command in `~/.claude/settings.json`, for the usage key
 - a plugin for each JetBrains IDE found, to select the session's terminal tab
@@ -173,7 +181,10 @@ counts as no. Everything else is installed for the current user only:
 | Bundled GNOME extension, if Window Calls is not used | `~/.local/share/gnome-shell/extensions/claude-session-deck-windows@local/` |
 | JetBrains plugin | `~/.local/share/JetBrains/<IDE and version>/claude-session-deck/` (Android Studio: under `Google/`) |
 
-To update, pull and run `./install.sh` again. To remove, run `./uninstall.sh`.
+To update, pull and run `./install.sh` again: it replaces the daemon, rebuilds
+the plugin of each IDE that has it, restarts the service and asks only about
+what is not set up yet. Sessions keep the keys you moved them to. To remove,
+run `./uninstall.sh`.
 
 **GNOME** needs a shell extension to focus windows. The script offers
 [Window Calls](https://extensions.gnome.org/extension/4724/window-calls/), which

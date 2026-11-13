@@ -17,12 +17,15 @@ die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- helpers -----------------------------------------------------------------
 assume_yes=false
+check_only=false
 for arg in "$@"; do
     case "$arg" in
         -y|--yes) assume_yes=true ;;
+        -c|--check) check_only=true ;;
         -h|--help)
-            echo "usage: ./install.sh [--yes]"
-            echo "  --yes  answer yes to every question (packages, extension, IDE plugin, udev rule)"
+            echo "usage: ./install.sh [--yes | --check]"
+            echo "  --yes    answer yes to every question (packages, extension, IDE plugin, udev rule)"
+            echo "  --check  only tell what is missing; nothing is installed or changed"
             exit 0 ;;
         *) die "unknown option: $arg" ;;
     esac
@@ -64,32 +67,92 @@ pkg_install() {
 
 is_gnome() { command -v gnome-shell >/dev/null && [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]]; }
 is_kde_wayland() { [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* && "${XDG_SESSION_TYPE:-}" == wayland ]]; }
-has_pillow() { "$python" -c 'from PIL import ImageFont; ImageFont.Layout' 2>/dev/null; }  # Layout: Pillow 9.1
-has_gi() { "$python" -c 'import gi; gi.require_version("Gio", "2.0")' 2>/dev/null; }
+# Windows are focused through X11 where no other way applies.
+uses_x11() { ! is_gnome && ! is_kde_wayland && [ -z "${SWAYSOCK:-}${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; }
 
 # --- dependencies ------------------------------------------------------------
-command -v systemctl >/dev/null || die "systemd (systemctl --user) is required"
-[ -x "$python" ] || pkg_install "Python 3" "$(pkg_name python3 python3 python python3)" ||
-    die "python3 is required"
-[ -x "$python" ] || die "$python is required: the service runs with it"
-"$python" -c 'import sys; sys.exit(sys.version_info < (3, 8))' || die "Python 3.8 or newer is required"
+font=$(sed -n 's/^FONT = "\(.*\)"$/\1/p' "$here/claude_session_deck.py")  # the font the daemon draws with
 
-has_pillow || pkg_install "the Python imaging library (Pillow)" \
-    "$(pkg_name python3-pil python3-pillow python-pillow python3-Pillow)" || true
-has_pillow || die "the Python imaging library (Pillow), 9.1 or newer, is required for $python; install it and run this again"
+has_systemd() { command -v systemctl; }
+has_python() { [ -x "$python" ] && "$python" -c 'import sys; sys.exit(sys.version_info < (3, 8))'; }
+has_pillow() { "$python" -c 'from PIL import ImageFont; ImageFont.Layout'; }  # Layout: Pillow 9.1
+has_gi() { "$python" -c 'import gi; gi.require_version("Gio", "2.0")'; }
+has_atspi() { "$python" -c 'import gi; gi.require_version("Atspi", "2.0"); from gi.repository import Atspi'; }
+has_x11() { "$python" -c 'import ctypes.util, sys; sys.exit(not ctypes.util.find_library("X11"))'; }
+has_gdbus() { command -v gdbus; }
+has_kdotool() { command -v kdotool; }
+has_font() { [ -f "$font" ]; }
+has_claude() { command -v claude || [ -d "$HOME/.claude" ]; }
 
-if ! has_gi; then
-    pkg_install "PyGObject, needed to notice a locked screen or sleep, and to focus windows on GNOME" \
-        "$(pkg_name python3-gi python3-gobject python-gobject python3-gobject)" || true
-    has_gi || warn "PyGObject is missing: the keys show sessions also while the screen is locked or the computer sleeps"
-    has_gi || ! is_gnome || warn "PyGObject is missing: keys cannot focus windows"
+# What is needed here, each as: required or optional | its test | what it is | what does not work without it | package
+gi_loss="a locked screen and sleep are not noticed, so the keys keep showing the sessions then"
+! is_gnome || gi_loss+="; keys cannot focus windows"
+deps=(
+    "required|has_systemd|systemd with user services (systemctl)|the daemon runs as a user service|"
+    "required|has_python|Python 3.8 or newer, as $python|the daemon is written in it, and the service runs it with this interpreter|$(pkg_name python3 python3 python python3)"
+    "required|has_pillow|Pillow 9.1 or newer, the Python imaging library|the keys cannot be drawn|$(pkg_name python3-pil python3-pillow python-pillow python3-Pillow)"
+    "optional|has_gi|PyGObject|$gi_loss|$(pkg_name python3-gi python3-gobject python-gobject python3-gobject)"
+)
+! is_gnome || deps+=("optional|has_gdbus|gdbus|the Window Calls extension cannot be set up, so the bundled one is used, which needs a logout|$(pkg_name libglib2.0-bin glib2 glib2 glib2-tools)")
+! is_kde_wayland || deps+=("optional|has_kdotool|kdotool|keys show sessions but cannot focus windows on KDE Wayland; without a package: cargo install kdotool|kdotool")
+! uses_x11 || deps+=("optional|has_x11|libX11|keys show sessions but cannot focus windows|$(pkg_name libx11-6 libX11 libx11 libX11-6)")
+! command -v ptyxis >/dev/null || deps+=("optional|has_atspi|the AT-SPI bindings for PyGObject|the session's tab is not selected in Ptyxis, only its window is raised|$(pkg_name gir1.2-atspi-2.0 at-spi2-core at-spi2-core typelib-1_0-Atspi-2_0)")
+deps+=(
+    "optional|has_font|the Ubuntu font ($font)|a wider font is used, so more text on the keys is shortened; FONT in claude_session_deck.py names the file|$(pkg_name fonts-ubuntu "" "" "")"
+    "optional|has_claude|Claude Code|there are no sessions to show|"
+)
+
+# check_deps [quiet]: sets `missing` to the lines of `deps` whose test fails, and tells each one's state
+check_deps() {
+    local line kind test what loss package
+    missing=()
+    for line in "${deps[@]}"; do
+        IFS='|' read -r kind test what loss package <<<"$line"
+        if "$test" >/dev/null 2>&1; then
+            [ "${1:-}" = quiet ] || printf '    \033[32mfound\033[0m    %s\n' "$what"
+        else
+            missing+=("$line")
+            [ "${1:-}" = quiet ] || printf '    \033[1;33mmissing\033[0m  %s (%s)\n' "$what" "$kind"
+        fi
+    done
+}
+
+# tell_missing: what is still missing, what that costs and how to get it; sets `missing_required`
+tell_missing() {
+    local line kind test what loss package packages=()
+    missing_required=false
+    for line in "${missing[@]}"; do
+        IFS='|' read -r kind test what loss package <<<"$line"
+        printf '    \033[1;33m%s\033[0m, %s\n        without it: %s\n' "$what" "$kind" "$loss"
+        if [ -n "$package" ]; then packages+=("$package"); else echo "        no package is known for it on this system"; fi
+        [ "$kind" != required ] || missing_required=true
+    done
+    [ ${#packages[@]} -eq 0 ] || case "$pkg_manager" in
+        apt-get) echo "    To install: sudo apt-get install ${packages[*]}" ;;
+        dnf)     echo "    To install: sudo dnf install ${packages[*]}" ;;
+        pacman)  echo "    To install: sudo pacman -S ${packages[*]}" ;;
+        zypper)  echo "    To install: sudo zypper install ${packages[*]}" ;;
+    esac
+}
+
+info "Checking what claude-session-deck needs here"
+check_deps
+if ! $check_only; then
+    for line in "${missing[@]}"; do
+        IFS='|' read -r kind test what loss package <<<"$line"
+        pkg_install "$what (without it: $loss)" "$package" || true
+    done
+    [ ${#missing[@]} -eq 0 ] || check_deps quiet
 fi
-
-if is_kde_wayland && ! command -v kdotool >/dev/null; then
-    pkg_install "kdotool, needed to focus windows on KDE Wayland" kdotool || true
-    command -v kdotool >/dev/null ||
-        warn "kdotool is missing: keys will show sessions but cannot focus windows.
-  If your distribution has no package: cargo install kdotool"
+if [ ${#missing[@]} -eq 0 ]; then
+    info "Nothing is missing"
+else
+    warn "missing:"
+    tell_missing
+    ! $missing_required || die "something required is missing: install it and run this again"
+fi
+if $check_only; then
+    exit 0
 fi
 
 # --- files -------------------------------------------------------------------
@@ -252,6 +315,10 @@ systemctl --user restart claude-session-deck.service
 
 echo
 info "Done. Logs: journalctl --user -u claude-session-deck -f"
+if [ ${#missing[@]} -gt 0 ]; then
+    warn "it runs, but this is still missing:"
+    tell_missing
+fi
 case "$extension" in
     pending)
         echo "    Window Calls is not installed, so the bundled extension is used. One step"
