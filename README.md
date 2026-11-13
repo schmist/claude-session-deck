@@ -28,6 +28,8 @@ It does:
 - Jump to a session's window when its key is pressed, on the
   [desktops](#jumping-to-a-session) it knows, and to its terminal tab in
   JetBrains IDEs and in Ptyxis.
+- Let you [move a session to another key](#moving-a-session): hold its key,
+  then press the key it is to be on.
 - Drive several decks of different [models](#decks) at once, real or emulated.
 - Take [plugins](#extending) for other places to find sessions, other
   desktops, other terminals and IDEs, other sandboxes and other deck models.
@@ -77,9 +79,9 @@ It does not:
 | Done | Green | A slow glow and a jumping creature, until you press the key |
 | Idle | Grey | None |
 
-Keys fill left to right, top to bottom, oldest session first. The bottom-right
-key is reserved, so a deck shows one session fewer than it has keys: 14 on an
-MK.2. Every deck shows the same sessions, as many as it has room for. A deck
+Keys fill left to right, top to bottom, oldest session first, unless you
+[move a session](#moving-a-session). The bottom-right key is reserved, so a
+deck shows one session fewer than it has keys: 14 on an MK.2. Every deck shows the same sessions, as many as it has room for. A deck
 with a [screen next to its keys](#screens-dials-and-touch-keys) shows the
 usage there and has all its keys for sessions.
 
@@ -88,6 +90,36 @@ limits: percentage used, a bar and the time until reset. It turns amber above
 65% and red above 85%. The figures come from Claude Code, so they only update
 while a session is active; for accounts without such limits the key reads
 `no data yet`.
+
+### Moving a session
+
+1. **Hold a session's key** for 0.6 s. The session is picked up: its key
+   shrinks, bobs up and down and gets a pulsing frame, and every free key
+   shows a `+`.
+2. **Press the key it is to be on.** It stays on that key from then on, also
+   when other sessions end.
+
+| The key you press | What happens |
+|---|---|
+| A free key | The session is put there. Its old key is filled by the sessions after it moving up |
+| Another session's key | The session takes that key. Coming from further right or below, the session that was there and those after it move on by one key, to the right and into the next row at the end of one. Coming from the left or above, they move up by one instead, as its old key became free |
+| The usage key, or the session's own key | The session is put down where it was |
+| No key for 10 s | The same |
+
+The usage key in the bottom-right corner never moves and nothing is moved onto
+it. A session that would be pushed off the last key for sessions gives up the
+key it was put on and takes a free one, if there is one.
+
+Sessions that were never moved keep filling the free keys in order, oldest
+first, around the ones that were put somewhere. The keys are numbered left to
+right, top to bottom, and the arrangement is the same on every deck: a session
+on the 12th key of an MK.2 is on the 12th key of an XL too, in another row.
+It is kept in `~/.cache/claude-session-deck/places.json`, so it survives a
+restart of the daemon, and is forgotten for a session when that session ends.
+
+Because a key can be held, a jump happens when the key is let go, not when it
+goes down. While a session is picked up, any press, short or long, puts it
+down.
 
 **While the screen is locked** the keys show no sessions. All keys of a deck
 together act as one large screen, on which the creature turns up now and then;
@@ -176,7 +208,8 @@ never writes to a session, its files or its terminal.
 Of a transcript the daemon keeps the name of the running tool, the token
 counts of the last reply and the model; the conversation itself is not kept,
 shown or logged. What it writes is the window it remembered for each session,
-in `~/.cache/claude-session-deck/windows.json`, and its log.
+in `~/.cache/claude-session-deck/windows.json`, the keys you moved sessions
+to, in `places.json` next to it, and its log.
 
 These files are internal to Claude Code, so an update can break
 claude-session-deck.
@@ -274,7 +307,7 @@ without having it:
 
 It prints the address of a page, `http://127.0.0.1:8317/` unless `--port` says
 otherwise, that shows each deck to scale with what the daemon draws on it.
-Click a key, dial or touch key to press it, scroll over a dial to turn it, and
+Click a key, dial or touch key to press it, keep the mouse button down to hold it, scroll over a dial to turn it, and
 click the screen of the + to touch it. The running service picks emulated
 decks up like real ones, next to those that are plugged in, and drops them
 when the emulator ends.
@@ -521,6 +554,8 @@ The settings are constants at the top of `claude_session_deck.py`; change them a
 | `SAFE_BOTTOM` | `9` | Bottom pixels left empty because the keycap rim hides them, of a key 72 px high; scaled for other models |
 | `MASCOT_EVERY` | `25` | Seconds between appearances of the large creature |
 | `MASCOT_SECONDS` | `6` | How long it stays |
+| `HOLD_SECONDS` | `0.6` | How long a key is held to pick its session up |
+| `MOVE_SECONDS` | `10` | How long a session that was picked up waits for its new key |
 | `LOCK_EVERY`, `LOCK_SECONDS` | `16`, `12` | While the screen is locked, the creature appears every 16 s for 12 s |
 | `MODEL_EVERY`, `MODEL_SECONDS` | `9`, `3` | The model replaces the name for 3 s every 9 s |
 | `MASCOT_ANIMATIONS` | walk 35, think 25, peek 20, wave 20 | Relative probability of each animation |

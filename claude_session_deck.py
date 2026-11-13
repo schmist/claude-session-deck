@@ -6,6 +6,7 @@ import ctypes.util
 import fcntl
 import glob
 import io
+import itertools
 import json
 import math
 import os
@@ -30,6 +31,7 @@ PLUGINS_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expandus
                            "claude-session-deck", "plugins")           # see load_plugins()
 STATUS_FILE = os.path.expanduser("~/.claude/claude-session-deck/status.json")   # written by statusline.sh
 WINDOWS_FILE = os.path.expanduser("~/.cache/claude-session-deck/windows.json")  # see learn_window()
+PLACES_FILE = os.path.expanduser("~/.cache/claude-session-deck/places.json")    # see Sessions.place()
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
                            "claude-session-deck")                # sockets of TOOLS and of emulated decks
 ELGATO_VENDOR = 0x0FD9
@@ -42,6 +44,8 @@ MASCOT_EVERY = 25           # seconds between mascot appearances while working
 MASCOT_SECONDS = 6          # how long it stays
 LOCK_EVERY = 16             # seconds between mascot appearances while the screen is locked
 LOCK_SECONDS = 12           # how long it stays then
+HOLD_SECONDS = 0.6          # how long a key is held to pick its session up, to put it on another key
+MOVE_SECONDS = 10           # how long a session that was picked up waits for its new key
 MODEL_EVERY, MODEL_SECONDS = 9, 3  # the model replaces the session's name for 3 s every 9 s
 FONT = "/usr/share/fonts/truetype/ubuntu/Ubuntu[wdth,wght].ttf"
 FALLBACK_FONT = "sans:bold"  # fontconfig pattern, used if FONT is missing
@@ -237,6 +241,7 @@ class Deck:
                 raise OSError("not a model this program knows")
             self.model = model_of(product)
             self.pressed = {}                      # control -> the states it last reported
+            self.held = {}                         # key -> when it went down, until it is let go or counts as held
             self.shown = [None] * self.model.keys
             self.screen_shown = [None] * self.model.panels
             self.slots = [None] * self.model.keys  # session shown on each key
@@ -325,8 +330,11 @@ class Deck:
     def events(self):
         """What was done to the deck, from the reports that have arrived, as (control, value).
 
-        ("key", n), ("push", n) and ("pad", n) tell that key, dial or touch key n
-        was newly pressed; "turn" and "touch" are as Model.read() tells them."""
+        ("key", n) tells that key n was pressed and let go, ("hold", n) that it
+        is down for HOLD_SECONDS, after which letting it go tells nothing. So a
+        deck with a key in `held` is to be asked again soon, report or not.
+        ("push", n) and ("pad", n) tell that dial or touch key n was newly
+        pressed; "turn" and "touch" are as Model.read() tells them."""
         events = []
         while True:
             try:
@@ -340,8 +348,19 @@ class Deck:
                     events.append((control, value))
                     continue
                 was = self.pressed.get(control) or [False] * len(value)
-                events += [(control, n) for n, down in enumerate(value) if down and not was[n]]
+                if control == "key":
+                    for n, down in enumerate(value):
+                        if down and not was[n]:
+                            self.held[n] = time.monotonic()
+                        elif was[n] and not down and self.held.pop(n, None) is not None:
+                            events.append(("key", n))
+                else:
+                    events += [(control, n) for n, down in enumerate(value) if down and not was[n]]
                 self.pressed[control] = value
+        for n, since in list(self.held.items()):
+            if time.monotonic() - since >= HOLD_SECONDS:
+                del self.held[n]
+                events.append(("hold", n))
         return events
 
     def close(self):
@@ -359,6 +378,17 @@ def read_proc(pid, name):
 def read_json(path):
     with open(path) as f:
         return json.load(f)
+
+
+def save_json(path, data, what):
+    """Keep `data` in the file at `path`; `what` names it in the log if that fails."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w") as out:
+            json.dump(data, out)
+        os.replace(path + ".tmp", path)
+    except OSError as e:
+        log(f"cannot save {what}:", e)
 
 
 def stat_fields(text):
@@ -664,6 +694,39 @@ def blank(size):
     if size not in _blanks:
         _blanks[size] = Image.new("RGB", (size, size), (0, 0, 0))
     return _blanks[size]
+
+
+_targets = {}  # key size -> target() of it
+
+
+def target(size):
+    """A free key of `size` pixels while a session is picked up: it can be put there."""
+    if size not in _targets:
+        s = scaler(size)
+        image = blank(size).copy()
+        g = ImageDraw.Draw(image)
+        top, bottom = s(6), size - s(SAFE_BOTTOM) - s(3)
+        g.rounded_rectangle((s(8), top, size - 1 - s(8), bottom), radius=s(8), outline=TRACK, width=max(1, s(2)))
+        x, y, arm = size // 2, (top + bottom) // 2, s(6)
+        g.line((x - arm, y, x + arm, y), fill=TRACK, width=max(1, s(2)))
+        g.line((x, y - arm, x, y + arm), fill=TRACK, width=max(1, s(2)))
+        _targets[size] = image
+    return _targets[size]
+
+
+def lifted(image, t):
+    """A session's key while the session is picked up: smaller, bobbing, in a frame that pulses."""
+    size = image.width
+    s = scaler(size)
+    wave = math.sin(t * 2 * math.pi * 1.2)
+    small = image.resize((s(54), s(54)), Image.LANCZOS)
+    x, y = (size - small.width) // 2, s(6) + round(s(3) * wave)
+    out = blank(size).copy()
+    out.paste(small, (x, y))
+    ImageDraw.Draw(out).rounded_rectangle(
+        (x - s(3), y - s(3), x + small.width + s(2), y + small.height + s(2)), radius=s(6),
+        outline=mix((110, 110, 110), (255, 255, 255), 0.5 + 0.5 * wave), width=max(1, s(2)))
+    return out
 
 
 def scaler(size):
@@ -1711,13 +1774,7 @@ def learn_window(session, live_keys):
     learned[session["key"]] = entry
     for key in set(learned) - live_keys:  # forget ended sessions
         del learned[key]
-    try:
-        os.makedirs(os.path.dirname(WINDOWS_FILE), exist_ok=True)
-        with open(WINDOWS_FILE + ".tmp", "w") as out:
-            json.dump(learned, out)
-        os.replace(WINDOWS_FILE + ".tmp", WINDOWS_FILE)
-    except OSError as e:
-        log("cannot save learned windows:", e)
+    save_json(WINDOWS_FILE, learned, "learned windows")
 
 
 def find_window(session, chain, title=None):
@@ -2087,6 +2144,7 @@ class Login:
             os.close(delay)
 
 
+PLACES_KEPT = 60      # seconds after the daemon's start in which the keys of sessions that are not found are kept
 SCAN_INTERVAL = 0.25  # seconds between looks at the sessions: often, to catch records before they are overwritten
 JUST_STARTED = 15     # seconds after its start in which a session's window is taken to have the focus
 
@@ -2096,7 +2154,18 @@ class Sessions:
 
     def __init__(self):
         self.sessions = {}     # as load_sessions() returns them
-        self.order = []        # their keys, oldest session first
+        self.by_age = []       # their keys, oldest session first
+        self.slots = []        # the session on each key of a deck, None on a free one
+        self.order = []        # the sessions in the order of their keys
+        self.places = {}       # session -> the key it was put on by hand, see place()
+        self.moving = None     # session that was picked up to be put on another key
+        self.moving_until = 0  # when it is put down again where it was
+        self.started = time.monotonic()
+        try:
+            saved = read_json(PLACES_FILE)
+            self.places = {sid: slot for sid, slot in saved.items() if isinstance(slot, int) and slot >= 0}
+        except (OSError, ValueError, AttributeError):
+            pass
         self.infos = {}        # session -> key_info() of it
         self.last_status = {}  # session -> status last seen
         self.since = {}        # session -> epoch seconds the status was entered
@@ -2112,10 +2181,16 @@ class Sessions:
         live_ids = {s["sessionId"] for s in sessions.values()}
         for stale in set(_transcripts) - live_ids:
             del _transcripts[stale]
-        # Oldest session first, so later ones move up when a session ends.
-        self.order = sorted(sessions, key=lambda sid: sessions[sid].get("startedAt") or 0)
+        self.by_age = sorted(sessions, key=lambda sid: sessions[sid].get("startedAt") or 0)
+        if self.moving not in sessions or time.monotonic() > self.moving_until:
+            self.moving = None
+        # Places of ended sessions are forgotten, but not right after the start: a sandbox reports its sessions late.
+        if time.monotonic() - self.started > PLACES_KEPT and not self.places.keys() <= sessions.keys():
+            self.places = {sid: slot for sid, slot in self.places.items() if sid in sessions}
+            save_json(PLACES_FILE, self.places, "the keys of the sessions")
+        self.arrange()
         self.infos = {}
-        for place, sid in enumerate(self.order):
+        for place, sid in enumerate(self.by_age):
             session = sessions[sid]
             status = session.get("status", "?")
             previous = self.last_status.get(sid)
@@ -2135,6 +2210,51 @@ class Sessions:
             # The offset keeps the keys from showing the mascot in sync.
             self.infos[sid] = key_info(session, "done" if sid in self.unseen else status,
                                        self.since[sid], place * 7.3)
+
+    def arrange(self):
+        """Give every session a key: one that was put on a key by hand that key, the others the
+        free keys in their order, oldest session first, so that they move up when a session ends."""
+        taken = {}
+        for sid, slot in list(self.places.items()):
+            if sid in self.sessions:
+                if slot in taken:  # only a damaged file says so
+                    del self.places[sid]
+                else:
+                    taken[slot] = sid
+        free = (slot for slot in itertools.count() if slot not in taken)
+        for sid in self.by_age:
+            if sid not in self.places:
+                taken[next(free)] = sid
+        self.slots = [taken.get(slot) for slot in range(max(taken, default=-1) + 1)]
+        self.order = [sid for sid in self.slots if sid]
+
+    def pick(self, sid):
+        """Pick a session up, to be put on another key; returns whether there is such a session."""
+        if sid not in self.sessions:
+            return False
+        self.moving, self.moving_until = sid, time.monotonic() + MOVE_SECONDS
+        return True
+
+    def place(self, slot, room):
+        """Put the session that was picked up on key `slot` of a deck with `room` keys for sessions.
+
+        It stays there. Sessions that were put on that key and the ones after it
+        by hand move on by one key each, into the next row at the end of one; a
+        session that would leave the deck this way takes a free key instead.
+        The other sessions fill the free keys as ever, so one that had the key
+        moves to the right if the session came from there, else to the left."""
+        sid, self.moving = self.moving, None
+        if sid not in self.sessions or not 0 <= slot < room or self.slots[slot:slot + 1] == [sid]:
+            return  # nothing is picked up, the key is not for sessions, or it is put down where it was
+        self.places.pop(sid, None)
+        taken = {at: other for other, at in self.places.items() if other in self.sessions}
+        while sid is not None and slot < room:
+            self.places[sid] = slot
+            sid, slot = taken.get(slot), slot + 1
+        if sid is not None:
+            del self.places[sid]
+        save_json(PLACES_FILE, self.places, "the keys of the sessions")
+        self.arrange()
 
     def visit(self, sid):
         """Jump to a session's window; returns whether there is such a session."""
@@ -2164,9 +2284,9 @@ def show(deck, board, now, frames):
 
     `frames` holds the images drawn for this moment, which decks with keys of one size share."""
     keys, size = deck.model.keys, deck.model.size
-    # Keys fill in order. The account usage is on the deck's screen, or on the last key if it has none.
+    # The account usage is on the deck's screen, or on the last key if it has none.
     usage = None if deck.model.screen else keys - 1
-    deck.slots = (board.order + [None] * keys)[:keys]
+    deck.slots = (board.slots + [None] * keys)[:keys]
     if deck.model.screen:
         deck.set_screen(render_screen(deck.model, board.counts()))
     else:
@@ -2177,13 +2297,17 @@ def show(deck, board, now, frames):
         if key == usage:
             image = usage_key(size, now)
         elif info is None:
-            image = blank(size)
+            image = target(size) if board.moving else blank(size)
         else:
             if (sid, size) not in frames:
                 frames[sid, size] = render(info, now, size)
             image = frames[sid, size]
             rate = max(rate, FPS if info["state"] in ANIMATED
                        else SCROLL_FPS if name_scroll(info["name"], now, size)[1] else 0)
+            if sid == board.moving:
+                if ("moving", size) not in frames:
+                    frames["moving", size] = lifted(image, now)
+                image, rate = frames["moving", size], FPS
         deck.set_image(key, image)
     return rate
 
@@ -2204,7 +2328,13 @@ def show_locked(deck, now, frames):
 def act(deck, board, control, value):
     """Do what a press, turn or touch on a deck asks for; returns whether it jumped to a session."""
     model = deck.model
-    if control == "key":
+    if control in ("key", "hold"):
+        if board.moving:  # any press puts it down: on that key, or where it was if the key is not for sessions
+            board.place(value, model.keys - (0 if model.screen else 1))
+            return False
+        if control == "hold":
+            board.pick(deck.slots[value])
+            return False
         return board.visit(deck.slots[value])
     if control == "turn":  # any dial sets the brightness
         deck.dim(sum(value))
@@ -2268,20 +2398,23 @@ def main():
 
     try:
         while not _stopping:
-            by_fd = {deck.fd: deck for deck in decks.values()}
-            for fd in select.select([WOKEN, *by_fd], [], [], max(0.0, next_frame - time.monotonic()))[0]:
-                if fd == WOKEN:
-                    os.read(fd, 64)
-                    next_frame = 0.0  # show it at once
-                    continue
+            wait = max(0.0, next_frame - time.monotonic())
+            if any(deck.held for deck in decks.values()):
+                wait = min(wait, HOLD_SECONDS / 10)  # to notice in time that a key is held
+            ready = select.select([WOKEN, *(deck.fd for deck in decks.values())], [], [], wait)[0]
+            if WOKEN in ready:
+                os.read(WOKEN, 64)
+                next_frame = 0.0  # show it at once
+            for deck in [deck for deck in decks.values() if deck.fd in ready or deck.held]:
                 try:
-                    for control, value in by_fd[fd].events():
+                    for control, value in deck.events():
                         if (login.locked or login.asleep) and control != "turn":
                             continue  # nobody is to jump to a window from a locked screen
-                        if act(by_fd[fd], board, control, value):
+                        if act(deck, board, control, value):
                             next_scan = 0.0
+                        next_frame = 0.0  # show what it did at once
                 except OSError as e:
-                    lose(by_fd[fd], e)
+                    lose(deck, e)
             now = time.monotonic()
             if now < next_frame:
                 continue
@@ -2302,6 +2435,8 @@ def main():
                 continue
             if now >= next_scan:
                 next_scan = now + SCAN_INTERVAL
+                if login.locked:
+                    board.moving = None
                 board.scan()
             rate, frames = 2, {}
             for deck in list(decks.values()):
