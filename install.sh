@@ -78,10 +78,11 @@ has_pillow || pkg_install "the Python imaging library (Pillow)" \
     "$(pkg_name python3-pil python3-pillow python-pillow python3-Pillow)" || true
 has_pillow || die "the Python imaging library (Pillow), 9.1 or newer, is required for $python; install it and run this again"
 
-if is_gnome && ! has_gi; then
-    pkg_install "PyGObject, needed to focus windows on GNOME" \
+if ! has_gi; then
+    pkg_install "PyGObject, needed to notice a locked screen or sleep, and to focus windows on GNOME" \
         "$(pkg_name python3-gi python3-gobject python-gobject python3-gobject)" || true
-    has_gi || warn "PyGObject is missing: keys will show sessions but cannot focus windows"
+    has_gi || warn "PyGObject is missing: the keys show sessions also while the screen is locked or the computer sleeps"
+    has_gi || ! is_gnome || warn "PyGObject is missing: keys cannot focus windows"
 fi
 
 if is_kde_wayland && ! command -v kdotool >/dev/null; then

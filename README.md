@@ -46,11 +46,21 @@ limits: percentage used, a bar and the time until reset. It turns amber above
 while a session is active; for accounts without such limits the key reads
 `no data yet`.
 
+**While the screen is locked** the keys show no sessions. All keys of a deck
+together act as one large screen, on which the creature turns up now and then;
+key presses do nothing.
+
+**When the computer sleeps, or the daemon stops** (at logout and shutdown, too),
+the deck goes dark: its keys are cleared and its light is switched off. A deck
+often keeps its power then, and would go on showing what it showed last. It
+lights up again when the computer wakes.
+
 ## Requirements
 
 - Linux with systemd user services
 - One or more Stream Decks of a [model it knows](#decks), or the [emulator](#emulated-decks)
 - Python 3.8+ with Pillow
+- To notice a locked screen or sleep: PyGObject and systemd's login manager
 - To jump to windows: a supported desktop, see [Jumping to a window](#jumping-to-a-window)
 - Optional: the Ubuntu font; the fallback font is wider, so more text gets shortened
 
@@ -71,7 +81,7 @@ cd claude-session-deck
 The script asks before each step that changes the system, and uses `sudo` only
 for packages and the udev rule:
 
-- missing packages (Pillow, PyGObject on GNOME, `kdotool` on KDE Wayland)
+- missing packages (Pillow, PyGObject, `kdotool` on KDE Wayland)
 - the Window Calls extension on GNOME
 - a status line command in `~/.claude/settings.json`, for the usage key
 - a plugin for each JetBrains IDE found, to select the session's terminal tab
@@ -158,6 +168,11 @@ runs its remaining arguments inside one, as `["sbx", "exec", "-i", name]`
 does.
 
 **Sessions in the same folder** are labelled with the name Claude gave them.
+
+**Locked screen and sleep.** The login manager (logind) tells the daemon over
+D-Bus when a session of yours is locked and when the computer is about to
+sleep. The daemon asks it to wait with sleeping until the decks are dark,
+which takes a moment. Without PyGObject the keys keep showing the sessions.
 
 **The deck.** The daemon writes images straight to the device and reads key
 presses from it, without a Stream Deck library. See [Decks](#decks).
@@ -334,6 +349,7 @@ The settings are constants at the top of `claude_session_deck.py`; change them a
 | `SAFE_BOTTOM` | `9` | Bottom pixels left empty because the keycap rim hides them, of a key 72 px high; scaled for other models |
 | `MASCOT_EVERY` | `25` | Seconds between appearances of the large creature |
 | `MASCOT_SECONDS` | `6` | How long it stays |
+| `LOCK_EVERY`, `LOCK_SECONDS` | `16`, `12` | While the screen is locked, the creature appears every 16 s for 12 s |
 | `MODEL_EVERY`, `MODEL_SECONDS` | `9`, `3` | The model replaces the name for 3 s every 9 s |
 | `MASCOT_ANIMATIONS` | walk 35, think 25, peek 20, wave 20 | Relative probability of each animation |
 | `FONT` | Ubuntu variable font | Font file used for all text |

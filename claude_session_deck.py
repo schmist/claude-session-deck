@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Show one Stream Deck key per running Claude Code session; a key press focuses its window."""
+import collections
 import ctypes
 import ctypes.util
 import fcntl
@@ -12,6 +13,7 @@ import re
 import random
 import select
 import shutil
+import signal
 import socket
 import stat
 import struct
@@ -36,6 +38,8 @@ CONTEXT_WINDOW = 1_000_000  # tokens at which the context bar is full
 SAFE_BOTTOM = 9             # bottom pixels hidden by the keycap rim, of a key UNIT pixels high
 MASCOT_EVERY = 25           # seconds between mascot appearances while working
 MASCOT_SECONDS = 6          # how long it stays
+LOCK_EVERY = 16             # seconds between mascot appearances while the screen is locked
+LOCK_SECONDS = 12           # how long it stays then
 MODEL_EVERY, MODEL_SECONDS = 9, 3  # the model replaces the session's name for 3 s every 9 s
 FONT = "/usr/share/fonts/truetype/ubuntu/Ubuntu[wdth,wght].ttf"
 FALLBACK_FONT = "sans:bold"  # fontconfig pattern, used if FONT is missing
@@ -229,6 +233,7 @@ class Deck:
             self.screen_shown = [None] * self.model.panels
             self.slots = [None] * self.model.keys  # session shown on each key
             self.brightness = BRIGHTNESS
+            self.dark = False                      # see darken()
             self._feature(self.model.brightness(BRIGHTNESS))
         except OSError:
             self.close()
@@ -285,6 +290,21 @@ class Deck:
         """Make the deck brighter by `steps`, or darker if they are negative."""
         self.brightness = min(100, max(5, self.brightness + 5 * steps))
         self._feature(self.model.brightness(self.brightness))
+
+    def darken(self):
+        """Show nothing and switch the light off: a deck may keep its power when the computer has none."""
+        if not self.dark:
+            self.dark = True
+            self.clear()
+            self._feature(self.model.brightness(0))
+
+    def lighten(self):
+        """Take back darken(). Nothing that was shown is taken to be shown still."""
+        if self.dark:
+            self.dark = False
+            self.shown = [None] * self.model.keys
+            self.screen_shown = [None] * self.model.panels
+            self._feature(self.model.brightness(self.brightness))
 
     def clear(self):
         for key in range(self.model.keys):
@@ -654,9 +674,10 @@ MASCOT_ROWS, MASCOT_COLS = 7, 12
 MASCOT_ANIMATIONS = {"walk": 35, "think": 25, "peek": 20, "wave": 20}
 
 
-def draw_sprite(g, x, y, px, feet="stand", look=0, blink=False, arms=(0, 0), color=None):
+def draw_sprite(g, x, y, px, feet="stand", look=0, blink=False, arms=(0, 0), color=None, scale=SS):
     """Draw the creature at (x, y), `px` pixels per cell; `feet` is "stand" or step 0/1,
-    `look` shifts the eyes by -1/0/1 and `arms` raises each side's arm."""
+    `look` shifts the eyes by -1/0/1 and `arms` raises each side's arm. `g` draws
+    `scale` times as large."""
     grid = [[False] * MASCOT_COLS for _ in range(MASCOT_ROWS)]
     for row in (0, 1, 2, 3, 4):
         for col in range(2, 10):
@@ -671,8 +692,8 @@ def draw_sprite(g, x, y, px, feet="stand", look=0, blink=False, arms=(0, 0), col
     x, y = round(x), round(y)
 
     def cell(col, row, color):
-        g.rectangle(((x + col * px) * SS, (y + row * px) * SS,
-                     (x + (col + 1) * px) * SS - 1, (y + (row + 1) * px) * SS - 1), fill=color)
+        g.rectangle(((x + col * px) * scale, (y + row * px) * scale,
+                     (x + (col + 1) * px) * scale - 1, (y + (row + 1) * px) * scale - 1), fill=color)
 
     for row in range(MASCOT_ROWS):
         for col in range(MASCOT_COLS):
@@ -702,40 +723,59 @@ def draw_icon(g, state, x, y, accent, t):
         draw_sprite(g, x, y, ICON_PX, blink=True, color=mix(MASCOT_COLOR, (70, 74, 84), 0.6))
 
 
-def draw_mascot(g, kind, phase, top, bottom):
-    """One of the mascot animations; `phase` is seconds since it started and
-    `top`/`bottom` bound the area it may use (1x pixels)."""
+# Where a mascot animation plays, in pixels: `px` is the size of one cell of
+# the creature, (`x`, `y`) where it stands, `width` and `bottom` the edges it
+# walks off over and rises from, and `hop` how high it jumps. An appearance
+# lasts `seconds`, of which it walks in, and out, for `walk`. The image drawn
+# on is `scale` times as large.
+Stage = collections.namedtuple("Stage", "px x y width bottom hop seconds walk scale",
+                               defaults=(MASCOT_SECONDS, 1.6, SS))
+
+
+def key_stage(kind, top, bottom):
+    """The stage for the animation `kind` on a key, between `top` and `bottom`."""
     px = 4 if bottom - top >= 34 else 3
-    w, h = MASCOT_COLS * px, MASCOT_ROWS * px
-    centre = (UNIT - w) / 2
+    h = MASCOT_ROWS * px
     floor = round(top + (bottom - top - h) / 2)  # stands centred in its area
     if kind == "think":  # leave room for the dots over its head
         floor = min(bottom - h, max(floor, top + 2 * px + 1))
-    left = MASCOT_SECONDS - phase
+    return Stage(px, (UNIT - MASCOT_COLS * px) / 2, floor, UNIT, UNIT, min(5, floor - top))
+
+
+def draw_mascot(g, kind, phase, stage):
+    """One of the mascot animations; `phase` is seconds since it started."""
+    px, x, floor = stage.px, stage.x, stage.y
+    w, h = MASCOT_COLS * px, MASCOT_ROWS * px
+    bob = max(1, px / 4)  # how far a step or a wave lifts it
+    left = stage.seconds - phase
     step = int(phase / 0.16) % 2
 
+    def draw(x, y, **pose):
+        draw_sprite(g, x, y, px, scale=stage.scale, **pose)
+
     if kind == "walk":  # walks in, hops and blinks, walks off
-        walk = 1.6
+        walk = stage.walk
         if phase < walk:
-            draw_sprite(g, -w + (centre + w) * phase / walk, floor - step, px, feet=step)
+            draw(-w + (x + w) * phase / walk, floor - step * bob, feet=step)
         elif left < walk:
-            draw_sprite(g, centre + (UNIT - centre) * (1 - left / walk), floor - step, px, feet=step)
+            draw(x + (stage.width - x) * (1 - left / walk), floor - step * bob, feet=step)
         else:
-            hop = abs(math.sin((phase - walk) * math.pi / 0.7)) * min(5, floor - top)
-            draw_sprite(g, centre, floor - hop, px, blink=(phase - walk) % 1.4 > 1.25)
+            hop = abs(math.sin((phase - walk) * math.pi / 0.7)) * stage.hop
+            draw(x, floor - hop, blink=(phase - walk) % 1.4 > 1.25)
         return
 
     # The others rise from the bottom edge and sink back at the end.
     rise = min(1.0, phase / 0.5, left / 0.5)
-    y = floor + (UNIT - floor) * (1 - rise)
+    y = floor + (stage.bottom - floor) * (1 - rise)
     inner = phase - 0.5
     if kind == "think":  # looks around while dots pop up over its head
         look = (0, -1, 0, 1)[int(inner / 0.9) % 4] if rise == 1 else 0
-        draw_sprite(g, centre, y, px, look=look, blink=inner % 2.2 > 2.05)
+        draw(x, y, look=look, blink=inner % 2.2 > 2.05)
         if rise == 1:
             for i in range(int(inner / 0.45) % 4):
-                dx = centre + w / 2 - 2.5 * px + i * 2 * px
-                g.rectangle((dx * SS, (y - 2 * px) * SS, (dx + px) * SS - 1, (y - px) * SS - 1),
+                dx = x + w / 2 - 2.5 * px + i * 2 * px
+                g.rectangle((dx * stage.scale, (y - 2 * px) * stage.scale,
+                             (dx + px) * stage.scale - 1, (y - px) * stage.scale - 1),
                             fill=mix(MASCOT_COLOR, (255, 255, 255), 0.5))
     elif kind == "peek":  # peeks over the edge, glances both ways, pops up
         if inner < 2.4:
@@ -744,12 +784,34 @@ def draw_mascot(g, kind, phase, top, bottom):
         else:
             y = min(y, floor + h * 0.55 * max(0.0, 1 - (inner - 2.4) / 0.25)) if rise == 1 else y
             look = 0
-        draw_sprite(g, centre, y, px, look=look if rise == 1 else 0, blink=3.6 < inner < 3.8)
+        draw(x, y, look=look if rise == 1 else 0, blink=3.6 < inner < 3.8)
     else:  # wave: swings its arms, with a little bounce
         beat = int(inner / 0.3) % 2 if rise == 1 else None
         arms = (0, 0) if beat is None else (1, 0) if beat else (0, 1)
-        bounce = abs(math.sin(inner * math.pi / 0.6)) * 2 if rise == 1 else 0
-        draw_sprite(g, centre, y - bounce, px, arms=arms, blink=inner % 1.8 > 1.65)
+        bounce = abs(math.sin(inner * math.pi / 0.6)) * 2 * bob if rise == 1 else 0
+        draw(x, y - bounce, arms=arms, blink=inner % 1.8 > 1.65)
+
+
+def render_locked(model, t):
+    """The images for a deck's keys while the screen is locked.
+
+    The keys together are one large screen, as if there were nothing between
+    them, on which the mascot appears now and then."""
+    size = model.size
+    width, height = model.cols * size, model.rows * size
+    # As large as leaves it room to walk in from the side, and for the dots over its head.
+    # On the MK.2 that is a third of a key for each of its cells, so its eyes are not cut in two.
+    px = int(min(width / (MASCOT_COLS + 3), height / (MASCOT_ROWS + 2)))
+    screen = Image.new("RGB", (width, height), (0, 0, 0))
+    appearance, phase = divmod(t, LOCK_EVERY)
+    if phase < LOCK_SECONDS:
+        kind = random.Random(appearance).choices(list(MASCOT_ANIMATIONS), weights=MASCOT_ANIMATIONS.values())[0]
+        stage = Stage(px, (width - MASCOT_COLS * px) / 2, height - MASCOT_ROWS * px, width, height,
+                      1.25 * px, LOCK_SECONDS, 3.0, 1)
+        draw_mascot(ImageDraw.Draw(screen), kind, phase, stage)
+    return [screen.crop((key % model.cols * size, key // model.cols * size,
+                         (key % model.cols + 1) * size, (key // model.cols + 1) * size))
+            for key in range(model.keys)]
 
 
 def render(info, t, size=UNIT):
@@ -815,7 +877,7 @@ def draw_key(info, t, show_model, name, shift, size):
             g.rectangle((x1, 0, x1 + seg / 12, bar),
                         fill=mix(mix(accent, (255, 255, 255), 0.45), mix(BASE, accent, 0.55), i / 12))
     if mascot is not None:
-        draw_mascot(g, kind, mascot, name_bottom + 2, UNIT - SAFE_BOTTOM)
+        draw_mascot(g, kind, mascot, key_stage(kind, name_bottom + 2, UNIT - SAFE_BOTTOM))
     else:
         draw_icon(g, state, PAD, time_y - round(MASCOT_ROWS * ICON_PX / 2), accent, t)
         if info["tokens"]:  # the bar ends where the number next to it starts
@@ -1683,6 +1745,93 @@ def attempt(action, *args):
         log(f"{action.__name__} failed: {e!r}")
 
 
+WOKEN, _wake = os.pipe()  # WOKEN can be read when the main loop has something new to look at
+os.set_blocking(WOKEN, False)
+_stopping = False
+
+
+def wake():
+    os.write(_wake, b".")
+
+
+def stop(*signal):
+    """End the main loop once it has finished what it is sending to a deck."""
+    global _stopping
+    _stopping = True
+    wake()
+
+
+class Login:
+    """What the system's login manager tells: whether the screen is locked, and when the computer sleeps.
+
+    Without PyGObject or logind neither is known, and both stay false."""
+
+    NAME, PATH, MANAGER = "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager"
+
+    def __init__(self):
+        self.locked = self.asleep = False     # wake() is called when one of them changes
+        self._delay = None                    # open file for which the computer waits before it sleeps
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _watch(self):
+        try:
+            from gi.repository import Gio, GLib
+            self._gio, self._glib = Gio, GLib
+            self._bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+            self._bus.signal_subscribe(self.NAME, self.MANAGER, "PrepareForSleep", self.PATH, None,
+                                       Gio.DBusSignalFlags.NONE, self._sleep)
+            self._bus.signal_subscribe(self.NAME, "org.freedesktop.DBus.Properties", "PropertiesChanged", None,
+                                       "org.freedesktop.login1.Session", Gio.DBusSignalFlags.NONE, self._read)
+            self._hold()
+            self._read()
+            GLib.MainLoop().run()
+        except Exception as e:
+            log(f"cannot tell a locked screen or sleep (is PyGObject installed?): {e}")
+
+    def _call(self, path, interface, method, signature=None, *args):
+        params = self._glib.Variant(signature, args) if signature else None
+        return self._bus.call_with_unix_fd_list_sync(self.NAME, path, interface, method, params, None,
+                                                     self._gio.DBusCallFlags.NONE, 2000, None, None)
+
+    def _set(self, **state):
+        if any(getattr(self, name) != value for name, value in state.items()):
+            vars(self).update(state)
+            wake()
+
+    def _read(self, *signal):
+        """Whether one of the user's sessions is locked."""
+        try:
+            sessions = self._call(self.PATH, self.MANAGER, "ListSessions")[0].unpack()[0]
+            self._set(locked=any(
+                self._call(path, "org.freedesktop.DBus.Properties", "Get", "(ss)",
+                           "org.freedesktop.login1.Session", "LockedHint")[0].unpack()[0]
+                for _, uid, _, _, path in sessions if uid == os.getuid()))
+        except Exception as e:
+            log(f"cannot tell whether the screen is locked: {e}")
+
+    def _hold(self):
+        """Make the computer wait with sleeping until ready() is called."""
+        try:
+            reply, files = self._call(self.PATH, self.MANAGER, "Inhibit", "(ssss)", "sleep",
+                                      "claude-session-deck", "Darken the Stream Deck", "delay")
+            self._delay = files.get(reply.unpack()[0])
+        except Exception as e:
+            log(f"cannot delay sleep, so the deck may stay lit: {e}")
+
+    def _sleep(self, bus, sender, path, interface, signal, params):
+        asleep = params.unpack()[0]
+        if not asleep:  # woke up
+            self._hold()
+            self._read()
+        self._set(asleep=asleep)
+
+    def ready(self):
+        """Let the computer sleep: the decks are dark."""
+        delay, self._delay = self._delay, None
+        if delay is not None:
+            os.close(delay)
+
+
 SCAN_INTERVAL = 0.25  # seconds between looks at the sessions: often, to catch records before they are overwritten
 JUST_STARTED = 15     # seconds after its start in which a session's window is taken to have the focus
 
@@ -1784,6 +1933,19 @@ def show(deck, board, now, frames):
     return rate
 
 
+def show_locked(deck, now, frames):
+    """Draw the mascot across a deck's keys; returns the frames a second that this needs."""
+    model = deck.model
+    if ("locked", model.id) not in frames:
+        frames["locked", model.id] = render_locked(model, now)
+    deck.slots = [None] * model.keys
+    if model.screen:
+        deck.set_screen(Image.new("RGB", model.screen, (0, 0, 0)))
+    for key, image in enumerate(frames["locked", model.id]):
+        deck.set_image(key, image)
+    return FPS if now % LOCK_EVERY < LOCK_SECONDS else 2
+
+
 def act(deck, board, control, value):
     """Do what a press, turn or touch on a deck asks for; returns whether it jumped to a session."""
     model = deck.model
@@ -1828,6 +1990,7 @@ def main():
     threading.Thread(target=watch_sandboxes, daemon=True).start()
     decks, errors = {}, {}  # both by path
     board = Sessions()
+    login = Login()
     next_frame = next_scan = next_look = 0.0
 
     def lose(deck, error):  # unplugged, or its emulator ended
@@ -1836,17 +1999,32 @@ def main():
         del decks[deck.path]
 
     try:
-        while True:
+        while not _stopping:
             by_fd = {deck.fd: deck for deck in decks.values()}
-            for fd in select.select(list(by_fd), [], [], max(0.0, next_frame - time.monotonic()))[0]:
+            for fd in select.select([WOKEN, *by_fd], [], [], max(0.0, next_frame - time.monotonic()))[0]:
+                if fd == WOKEN:
+                    os.read(fd, 64)
+                    next_frame = 0.0  # show it at once
+                    continue
                 try:
                     for control, value in by_fd[fd].events():
+                        if (login.locked or login.asleep) and control != "turn":
+                            continue  # nobody is to jump to a window from a locked screen
                         if act(by_fd[fd], board, control, value):
                             next_scan = 0.0
                 except OSError as e:
                     lose(by_fd[fd], e)
             now = time.monotonic()
             if now < next_frame:
+                continue
+            if login.asleep:  # going to sleep, or just woken up before that is told
+                for deck in list(decks.values()):
+                    try:
+                        deck.darken()
+                    except OSError as e:
+                        lose(deck, e)
+                login.ready()
+                next_frame = now + 1
                 continue
             if now >= next_look:
                 next_look = now + DECK_INTERVAL
@@ -1860,14 +2038,16 @@ def main():
             rate, frames = 2, {}
             for deck in list(decks.values()):
                 try:
-                    rate = max(rate, show(deck, board, now, frames))
+                    deck.lighten()
+                    rate = max(rate, show_locked(deck, now, frames) if login.locked
+                               else show(deck, board, now, frames))
                 except OSError as e:
                     lose(deck, e)
             next_frame = now + 1 / rate
     finally:
         for deck in decks.values():
             try:
-                deck.clear()
+                deck.darken()
             except OSError:
                 pass
             deck.close()
@@ -1920,6 +2100,7 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             pass
         sys.exit()
+    signal.signal(signal.SIGTERM, stop)  # stopped, as at logout and shutdown: main() leaves the decks dark
     try:
         main()
     except KeyboardInterrupt:
