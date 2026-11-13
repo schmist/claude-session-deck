@@ -24,6 +24,7 @@ Not affiliated with Anthropic or Elgato.
 | Line under the name | While working: the running tool (`Bash`, `Edit`, …) or `thinking`. While waiting: the reason |
 | Bar and number | Context used, in tokens, on a 1M scale; amber above 65%, red above 85% |
 | Creature and time | How long the session has been in its current state |
+| Code in the creature's place, e.g. `O5.5` | The session's model: initial of its family and its version, so `claude-opus-5-5` is `O5.5`. It replaces the small creature for 3 s every 9 s, on all keys at once |
 
 | State | Colour | Animation |
 |---|---|---|

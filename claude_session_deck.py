@@ -38,6 +38,7 @@ CONTEXT_WINDOW = 1_000_000  # tokens at which the context bar is full
 SAFE_BOTTOM = 9             # bottom pixels hidden by the keycap rim
 MASCOT_EVERY = 25           # seconds between mascot appearances while working
 MASCOT_SECONDS = 6          # how long it stays
+MODEL_EVERY, MODEL_SECONDS = 9, 3  # the model replaces the small creature for 3 s every 9 s
 FONT = "/usr/share/fonts/truetype/ubuntu/Ubuntu[wdth,wght].ttf"
 FALLBACK_FONT = "sans:bold"  # fontconfig pattern, used if FONT is missing
 BOOT_TIME = time.time() - float(open("/proc/uptime").read().split()[0])
@@ -243,6 +244,9 @@ def label(session):
 
 _transcripts = {}  # session id -> (path, mtime, size, info)
 TRANSCRIPT_TAIL = 400_000  # bytes read from the end
+# What Claude Code records when /model switches the model, e.g. "Set model to `Opus 5.5`".
+# Only a name with a version counts: "Default" says nothing until the next reply.
+MODEL_SWITCH = re.compile(r'"text":\s*"<local-command-stdout>Set model to `([^`]*\d[^`]*)`')
 TITLE_FIELDS = {"custom-title": "customTitle", "ai-title": "aiTitle"}  # entry type -> field
 
 
@@ -281,11 +285,14 @@ def parse_transcript(lines, previous):
     info = dict(previous)  # keep values the tail no longer has
     for key in ("tool", "status", "since"):
         info.pop(key, None)
-    seen_turn = seen_usage = False
+    seen_turn = seen_usage = switched = False
     titles = set()
     for line in reversed(lines):
         if seen_usage and '-title"' not in line:
             continue
+        switch = not seen_usage and not switched and MODEL_SWITCH.search(line)
+        if switch:  # a /model command newer than the last reply
+            info["model"], switched = switch[1], True
         try:
             entry = json.loads(line)
         except ValueError:
@@ -321,6 +328,8 @@ def parse_transcript(lines, previous):
         usage = msg.get("usage")
         if not seen_usage and kind == "assistant" and usage:
             seen_usage = True
+            if not str(msg.get("model") or "<").startswith("<") and not switched:  # "<synthetic>" is no model's reply
+                info["model"] = msg["model"]
             info["tokens"] = sum(usage.get(k) or 0 for k in (
                 "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
     return info
@@ -335,6 +344,14 @@ def fmt_duration(seconds):
     if seconds >= 2 * 86400:
         return f"{seconds // 86400}d"
     return f"{seconds // 3600}h{seconds % 3600 // 60:02d}"
+
+
+def fmt_model(model):
+    """Short form of a model: family initial and version, "claude-opus-5-5" or "Opus 5.5" -> "O5.5"."""
+    parts = re.split(r"[-\s.]", model or "")
+    family = [p for p in parts if p.isalpha() and p != "claude"]
+    version = [p for p in parts if p.isdigit() and len(p) < 3]  # not a date
+    return family[0][0].upper() + ".".join(version[:2]) if family else ""
 
 
 def fmt_tokens(n):
@@ -536,6 +553,9 @@ def render(info, t):
         rng = random.Random(f"{info.get('offset', 0)}:{(t + info.get('offset', 0)) // MASCOT_EVERY}")
         kind = rng.choices(list(MASCOT_ANIMATIONS), weights=MASCOT_ANIMATIONS.values())[0]
 
+    # Now and then the model takes the place of the small creature, on all keys at once.
+    show_model = bool(info.get("model")) and t % MODEL_EVERY >= MODEL_EVERY - MODEL_SECONDS
+
     big = SIZE * SS
     img = Image.composite(Image.new("RGB", (big, big), mix(BASE, accent, tint)),
                           Image.new("RGB", (big, big), BASE), _gradient)
@@ -559,7 +579,8 @@ def render(info, t):
     if mascot is not None:
         draw_mascot(g, kind, mascot, name_bottom + 2, SIZE - SAFE_BOTTOM)
     else:
-        draw_icon(g, state, 4, time_y - round(MASCOT_ROWS * ICON_PX / 2), accent, t)
+        if not show_model:
+            draw_icon(g, state, 4, time_y - round(MASCOT_ROWS * ICON_PX / 2), accent, t)
         if info.get("tokens"):
             x2 = (SIZE - 4 - small.getlength(info["tokens"]) - 4) * SS
             box = (4 * SS, (bar_y - 2) * SS, x2, (bar_y + 2) * SS)
@@ -586,6 +607,9 @@ def render(info, t):
     if info.get("activity"):
         line = font(11, "Condensed Medium")
         d.text((4, name_bottom + 1), fit(info["activity"], line, SIZE - 8), font=line, fill=soft)
+    if show_model:  # in the place of the small creature
+        d.text((4 + MASCOT_COLS * ICON_PX / 2, time_y), info["model"], font=font(11),
+               fill=mix(accent, (255, 255, 255), 0.3), anchor="mm")
     d.text((SIZE - 4, bar_y), info.get("tokens", ""), font=small, fill=dim, anchor="rm")
     return img
 
@@ -1290,6 +1314,7 @@ def key_info(session, state, since):
         "state": state,
         "activity": activity,
         "tokens": fmt_tokens(tokens),
+        "model": fmt_model(meta.get("model")),
         "context": tokens / CONTEXT_WINDOW,
         "elapsed": fmt_duration(time.time() - since) if state != "unknown" else "?",
     }
