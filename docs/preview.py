@@ -18,10 +18,10 @@ PX_PER_MM = 5.05
 BODY = (round(118 * PX_PER_MM), round(84 * PX_PER_MM))
 GAP = 36
 COLS, ROWS = 5, 3
+SS = csd.SS       # the deck is drawn supersampled like the keys, which are pasted unscaled
 KEY_RADIUS = 9    # corners of a key's window
 BODY_RADIUS = 40
 MARGIN = 34       # around the deck, for its shadow
-SS = 4            # the deck is drawn supersampled; the keys are pasted unscaled
 T = 3.0           # moment shown: names are up, and one creature is on stage
 
 # name, state, line under the name, tokens, time in the state, mascot offset
@@ -50,10 +50,10 @@ def key_images():
     return images
 
 
-def rounded(size, radius, fill, scale=SS):
+def rounded(size, radius, fill):
     """Antialiased mask of a rounded rectangle of `size`."""
-    mask = Image.new("L", (size[0] * scale, size[1] * scale), 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, mask.width - 1, mask.height - 1), radius * scale, fill=fill)
+    mask = Image.new("L", (size[0] * SS, size[1] * SS), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, mask.width - 1, mask.height - 1), radius * SS, fill=fill)
     return mask.resize(size, Image.LANCZOS)
 
 

@@ -53,13 +53,18 @@ class Deck:
         self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
         self.pressed = [False] * KEYS
         self.shown = [None] * KEYS
-        self._feature(bytes([0x03, 0x08, BRIGHTNESS]))
+        try:
+            self._feature(bytes([0x03, 0x08, BRIGHTNESS]))
+        except OSError:
+            self.close()
+            raise
 
     @staticmethod
     def find():
         for dev in glob.glob("/sys/class/hidraw/hidraw*"):
             try:
-                uevent = open(dev + "/device/uevent").read()
+                with open(dev + "/device/uevent") as f:
+                    uevent = f.read()
             except OSError:
                 continue
             m = re.search(r"HID_ID=\w+:(\w+):(\w+)", uevent)
@@ -82,7 +87,8 @@ class Deck:
 
     def set_image(self, key, image):
         """Draw `image` on `key`; skipped if `image` is what is shown already."""
-        if self.shown[key] == image.tobytes():
+        pixels = image.tobytes()
+        if self.shown[key] == pixels:
             return
         buf = io.BytesIO()
         image.rotate(180).save(buf, "JPEG", quality=90)
@@ -94,7 +100,7 @@ class Deck:
                             page & 0xFF, page >> 8])
             self._write((header + chunk).ljust(1024, b"\0"))
             page += 1
-        self.shown[key] = image.tobytes()
+        self.shown[key] = pixels
 
     def poll_presses(self, timeout):
         """Wait up to `timeout` seconds; return keys that were newly pressed."""
@@ -119,12 +125,43 @@ class Deck:
 
 # -------------------------------------------------------------- sessions ---
 
-def proc_start(pid):
+def read_proc(pid, name):
+    """Text of /proc/<pid>/<name>."""
+    with open(f"/proc/{pid}/{name}", errors="replace") as f:  # arguments need not be UTF-8
+        return f.read()
+
+
+def read_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def stat_fields(text):
+    """(parent pid, terminal, start time) from the text of a /proc/<pid>/stat, None if it is not one."""
+    fields = text.rsplit(")", 1)[-1].split()
     try:
-        stat = open(f"/proc/{pid}/stat").read()
+        return int(fields[1]), fields[4], fields[19]
+    except (IndexError, ValueError):
+        return None
+
+
+def proc_stat(pid):
+    """(parent pid, terminal, start time) of a process, None if there is none."""
+    try:
+        return stat_fields(read_proc(pid, "stat"))
     except OSError:
         return None
-    return stat.rsplit(")", 1)[1].split()[19]  # field 22: starttime
+
+
+def proc_start(pid):
+    fields = proc_stat(pid)
+    return fields and fields[2]
+
+
+def is_session(s, start):
+    """Whether a session file describes an interactive session of the process started at `start`."""
+    return s.get("kind", "interactive") == "interactive" and bool(s.get("sessionId")) \
+        and str(s.get("procStart")) == start
 
 
 def load_sessions():
@@ -133,18 +170,16 @@ def load_sessions():
     sessions = {}
     for path in glob.glob(os.path.join(SESSIONS_DIR, "*.json")):
         try:
-            s = json.load(open(path))
+            s = read_json(path)
         except (OSError, ValueError):
-            continue
-        if s.get("kind", "interactive") != "interactive" or not s.get("sessionId"):
             continue
         # A file from another pid namespace belongs to a container: see below.
         domain = re.search(r"pid:\[\d+\]", s.get("pidDomain", ""))
-        start = str(s.get("procStart"))
-        if (domain and domain[0] != own_ns) or proc_start(s.get("pid")) != start:
+        start = proc_start(s.get("pid"))
+        if (domain and domain[0] != own_ns) or not is_session(s, start):
             continue
-        s["hostPid"] = s["pid"]
-        sessions[s["pid"], start] = s
+        s.update(hostPid=s["pid"], key=f"{s['pid']}:{start}")
+        sessions[s["key"]] = s
     sessions.update(container_sessions(own_ns))
     for found in list(_sandboxed.values()):
         sessions.update(found)
@@ -158,33 +193,45 @@ def load_sessions():
     return sessions
 
 
+CLAUDE_PIDS_INTERVAL = 2  # seconds between searches of /proc for Claude processes
+_claude_pids = (float("-inf"), [])  # (when /proc was searched, the pids found)
+
+
+def claude_pids():
+    """Pids of the Claude processes on this host, in a container or not."""
+    global _claude_pids
+    if time.monotonic() - _claude_pids[0] >= CLAUDE_PIDS_INTERVAL:
+        pids = []
+        for entry in os.listdir("/proc"):
+            try:
+                if entry.isdigit() and read_proc(entry, "comm").strip() == "claude":
+                    pids.append(int(entry))
+            except OSError:
+                continue
+        _claude_pids = (time.monotonic(), pids)
+    return _claude_pids[1]
+
+
 def container_sessions(own_ns):
     """Sessions of Claude processes in containers, from the session file each container sees."""
     found = {}
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
+    for pid in claude_pids():
         try:
-            if open(f"/proc/{entry}/comm").read().strip() != "claude":
+            parent, tty, start = proc_stat(pid) or (0, "0", "")
+            if os.readlink(f"/proc/{pid}/ns/pid") == own_ns or tty == "0" \
+                    or read_proc(parent, "comm").strip() == "claude":
                 continue
-            ns = os.readlink(f"/proc/{entry}/ns/pid")
-            fields = open(f"/proc/{entry}/stat").read().rsplit(")", 1)[1].split()
-            parent, tty, start = fields[1], fields[4], fields[19]
-            if ns == own_ns or tty == "0" \
-                    or open(f"/proc/{parent}/comm").read().strip() == "claude":
-                continue
-            env = dict(v.split("=", 1) for v in open(f"/proc/{entry}/environ").read().split("\0") if "=" in v)
+            env = dict(v.split("=", 1) for v in read_proc(pid, "environ").split("\0") if "=" in v)
             inner = env.get("CLAUDE_CONFIG_DIR") or os.path.join(env.get("HOME", "/"), ".claude")
-            config = f"/proc/{entry}/root/{inner.lstrip('/')}"  # the container's files, as the host sees them
-            inner_pid = re.search(r"^NSpid:.*?(\d+)$", open(f"/proc/{entry}/status").read(), re.M)[1]
-            s = json.load(open(os.path.join(config, "sessions", inner_pid + ".json")))
-        except (OSError, ValueError, TypeError, IndexError):
+            config = f"/proc/{pid}/root/{inner.lstrip('/')}"  # the container's files, as the host sees them
+            inner_pid = re.search(r"^NSpid:.*?(\d+)$", read_proc(pid, "status"), re.M)[1]
+            s = read_json(os.path.join(config, "sessions", inner_pid + ".json"))
+        except (OSError, ValueError, TypeError):
             continue
-        if s.get("kind", "interactive") != "interactive" or not s.get("sessionId") \
-                or str(s.get("procStart")) != start:
+        if not is_session(s, start):
             continue
-        s.update(hostPid=int(entry), projects=os.path.join(config, "projects"))
-        found[int(entry), start] = s
+        s.update(hostPid=pid, key=f"{pid}:{start}", container=True, projects=os.path.join(config, "projects"))
+        found[s["key"]] = s
     return found
 
 
@@ -309,8 +356,23 @@ ACCENT = {
 ANIMATED = {"busy", "waiting", "done"}
 _fonts = {}
 _fallback_file = None
+PAD = 4                      # pixels left free at a key's left and right edge
+NAME_WIDTH = SIZE - 2 * PAD  # room for the name
+TRACK = (48, 52, 60)         # the empty part of a bar
 _gradient = Image.linear_gradient("L").resize((SIZE * SS, SIZE * SS)).point(lambda v: 255 - v)
 BLANK = Image.new("RGB", (SIZE, SIZE), (0, 0, 0))
+
+
+def background(accent, tint):
+    """A key's supersampled background: `accent` at the top, fading out towards the bottom."""
+    big = SIZE * SS
+    return Image.composite(Image.new("RGB", (big, big), mix(BASE, accent, tint)),
+                           Image.new("RGB", (big, big), BASE), _gradient)
+
+
+def level_color(used, normal):
+    """Colour of a bar that is `used` (0..1) full: amber and red warn that it fills up."""
+    return (255, 80, 80) if used > 0.85 else (255, 190, 70) if used > 0.65 else normal
 
 
 def fallback_font_file():
@@ -360,7 +422,7 @@ def name_scroll(name, t):
     """(pixels a name too wide for its key is moved left at time `t`, whether it is moving).
 
     Each time the name appears it rests for a second, moves until its end shows and rests there."""
-    over = font(NAME_SIZE).getlength(name) - (SIZE - 8)
+    over = font(NAME_SIZE).getlength(name) - NAME_WIDTH
     if over <= 0:
         return 0, False
     shown = MODEL_EVERY - MODEL_SECONDS            # seconds the name is shown for
@@ -476,6 +538,26 @@ def draw_mascot(g, kind, phase, top, bottom):
 def render(info, t):
     """Key image for a session; `t` (seconds) drives the animations."""
     state = info["state"]
+    # Now and then the model takes the place of the session's name, on all keys at once.
+    show_model = bool(info["model"]) and t % MODEL_EVERY >= MODEL_EVERY - MODEL_SECONDS
+    name_font = font(NAME_SIZE)
+    name = fit(info["model"], name_font, NAME_WIDTH) if show_model else info["name"]
+    shift = name_scroll(name, t)[0]
+    if state not in ANIMATED:  # then only these make one image differ from the next
+        drawn = (tuple(info.items()), name, shift)
+        if drawn not in _still:
+            if len(_still) > 4 * KEYS:
+                _still.clear()
+            _still[drawn] = draw_key(info, t, show_model, name, shift)
+        return _still[drawn]
+    return draw_key(info, t, show_model, name, shift)
+
+
+_still = {}  # what a key without animation was drawn from -> its image
+
+
+def draw_key(info, t, show_model, name, shift):
+    state = info["state"]
     accent = ACCENT.get(state, ACCENT["idle"])
     pulse = 0.0
     if state == "waiting":
@@ -485,25 +567,19 @@ def render(info, t):
         pulse = 0.5 - 0.5 * math.cos(t * 2 * math.pi / 3.0)
         tint = 0.26 + 0.16 * pulse
     else:
-        tint = {"busy": 0.2}.get(state, 0.07)
+        tint = 0.2 if state == "busy" else 0.07
     mascot = None
     if state == "busy":
-        phase = (t + info.get("offset", 0)) % MASCOT_EVERY
+        appearance, phase = divmod(t + info["offset"], MASCOT_EVERY)
         mascot = phase if phase < MASCOT_SECONDS else None
         # Pick the animation at random, but the same one for a whole appearance.
-        rng = random.Random(f"{info.get('offset', 0)}:{(t + info.get('offset', 0)) // MASCOT_EVERY}")
+        rng = random.Random(f"{info['offset']}:{appearance}")
         kind = rng.choices(list(MASCOT_ANIMATIONS), weights=MASCOT_ANIMATIONS.values())[0]
 
-    # Now and then the model takes the place of the session's name, on all keys at once.
-    show_model = bool(info.get("model")) and t % MODEL_EVERY >= MODEL_EVERY - MODEL_SECONDS
-
     big = SIZE * SS
-    img = Image.composite(Image.new("RGB", (big, big), mix(BASE, accent, tint)),
-                          Image.new("RGB", (big, big), BASE), _gradient)
+    img = background(accent, tint)
     g = ImageDraw.Draw(img)
     name_font = font(NAME_SIZE)
-    name = fit(info["model"], name_font, SIZE - 8) if show_model else info["name"]
-    shift = name_scroll(name, t)[0]
     name_bottom = 5 + NAME_SIZE
     small = font(10, "Condensed Medium")
     time_y = SIZE - SAFE_BOTTOM - 9   # centre of the time row
@@ -522,15 +598,14 @@ def render(info, t):
     if mascot is not None:
         draw_mascot(g, kind, mascot, name_bottom + 2, SIZE - SAFE_BOTTOM)
     else:
-        draw_icon(g, state, 4, time_y - round(MASCOT_ROWS * ICON_PX / 2), accent, t)
-        if info.get("tokens"):
-            x2 = (SIZE - 4 - small.getlength(info["tokens"]) - 4) * SS
-            box = (4 * SS, (bar_y - 2) * SS, x2, (bar_y + 2) * SS)
-            g.rounded_rectangle(box, 2 * SS, fill=(48, 52, 60))
-            used = min(1.0, info.get("context", 0))
-            fill = (255, 80, 80) if used > 0.85 else (255, 190, 70) if used > 0.65 else (165, 172, 185)
+        draw_icon(g, state, PAD, time_y - round(MASCOT_ROWS * ICON_PX / 2), accent, t)
+        if info["tokens"]:
+            x2 = (SIZE - PAD - small.getlength(info["tokens"]) - 4) * SS
+            box = (PAD * SS, (bar_y - 2) * SS, x2, (bar_y + 2) * SS)
+            g.rounded_rectangle(box, 2 * SS, fill=TRACK)
+            used = min(1.0, info["context"])
             g.rounded_rectangle((box[0], box[1], box[0] + max(4 * SS, (x2 - box[0]) * used), box[3]),
-                                2 * SS, fill=fill)
+                                2 * SS, fill=level_color(used, (165, 172, 185)))
     img = img.resize((SIZE, SIZE), Image.LANCZOS)
 
     # --- text, at 1x --------------------------------------------------------
@@ -541,9 +616,9 @@ def render(info, t):
     if show_model:  # tinted, to tell it from the name
         color = mix(accent, color, 0.35)
     # The name is drawn on its own strip, which cuts off what is scrolled out of it.
-    box = (4, 0, SIZE - 4, name_bottom + 4)
+    box = (PAD, 0, PAD + NAME_WIDTH, name_bottom + 4)
     strip = img.crop(box)
-    if mascot is not None and name_font.getlength(name) <= SIZE - 8:  # centred like the mascot below it
+    if mascot is not None and name_font.getlength(name) <= NAME_WIDTH:  # centred like the mascot below it
         ImageDraw.Draw(strip).text((strip.width / 2, 5), name, font=name_font, fill=color, anchor="ma")
     else:
         ImageDraw.Draw(strip).text((-shift, 5), name, font=name_font, fill=color)
@@ -551,13 +626,13 @@ def render(info, t):
     if mascot is not None:
         return img
     big_font = font(18)
-    time_x = 4 + round(MASCOT_COLS * ICON_PX) + 3
+    time_x = PAD + round(MASCOT_COLS * ICON_PX) + 3
     d.text((time_x, time_y), info["elapsed"], font=big_font,
            fill=mix(accent, (255, 255, 255), 0.3), anchor="lm")
-    if info.get("activity"):
+    if info["activity"]:
         line = font(11, "Condensed Medium")
-        d.text((4, name_bottom + 1), fit(info["activity"], line, SIZE - 8), font=line, fill=soft)
-    d.text((SIZE - 4, bar_y), info.get("tokens", ""), font=small, fill=dim, anchor="rm")
+        d.text((PAD, name_bottom + 1), fit(info["activity"], line, NAME_WIDTH), font=line, fill=soft)
+    d.text((SIZE - PAD, bar_y), info["tokens"], font=small, fill=dim, anchor="rm")
     return img
 
 
@@ -570,7 +645,7 @@ def account_usage():
     try:
         mtime = os.stat(STATUS_FILE).st_mtime
         if _usage[0] != mtime:
-            _usage = (mtime, json.load(open(STATUS_FILE)).get("rate_limits") or {})
+            _usage = (mtime, read_json(STATUS_FILE).get("rate_limits") or {})
     except (OSError, ValueError):
         return []
     windows = []
@@ -590,18 +665,16 @@ def render_usage():
     windows = account_usage()
     big = SIZE * SS
     worst = max((used for _, used, _ in windows), default=0)
-    accent = (255, 80, 80) if worst > 0.85 else (255, 190, 70) if worst > 0.65 else MASCOT_COLOR
-    img = Image.composite(Image.new("RGB", (big, big), mix(BASE, accent, 0.14)),
-                          Image.new("RGB", (big, big), BASE), _gradient)
+    accent = level_color(worst, MASCOT_COLOR)
+    img = background(accent, 0.14)
     g = ImageDraw.Draw(img)
     g.rectangle((0, 0, big, 3 * SS), fill=mix(BASE, accent, 0.7))
     rows = [7 + i * 27 for i in range(len(windows))]  # top of each window's block
     for y, (_, used, _) in zip(rows, windows):
-        box = (4 * SS, (y + 16) * SS, (SIZE - 4) * SS, (y + 21) * SS)
-        g.rounded_rectangle(box, 2.5 * SS, fill=(48, 52, 60))
-        fill = (255, 80, 80) if used > 0.85 else (255, 190, 70) if used > 0.65 else MASCOT_COLOR
+        box = (PAD * SS, (y + 16) * SS, (SIZE - PAD) * SS, (y + 21) * SS)
+        g.rounded_rectangle(box, 2.5 * SS, fill=TRACK)
         g.rounded_rectangle((box[0], box[1], box[0] + max(5 * SS, (box[2] - box[0]) * min(1, used)),
-                             box[3]), 2.5 * SS, fill=fill)
+                             box[3]), 2.5 * SS, fill=level_color(used, MASCOT_COLOR))
     img = img.resize((SIZE, SIZE), Image.LANCZOS)
     d = ImageDraw.Draw(img)
     dim = (150, 156, 168)
@@ -611,12 +684,12 @@ def render_usage():
         return img
     small = font(10, "Condensed Medium")
     for y, (name, used, left) in zip(rows, windows):
-        d.text((4, y + 13), name, font=font(11), fill=(255, 255, 255), anchor="ls")
-        x = 4 + font(11).getlength(name) + 3
+        d.text((PAD, y + 13), name, font=font(11), fill=(255, 255, 255), anchor="ls")
+        x = PAD + font(11).getlength(name) + 3
         # Time until the window resets, in whole hours once minutes stop mattering.
         reset = f"{int(left // 3600)}h" if 10 * 3600 <= left < 2 * 86400 else fmt_duration(left)
         d.text((x, y + 13), reset, font=small, fill=dim, anchor="ls")
-        d.text((SIZE - 4, y + 13), f"{round(used * 100)}%", font=font(15), fill=(255, 255, 255), anchor="rs")
+        d.text((SIZE - PAD, y + 13), f"{round(used * 100)}%", font=font(15), fill=(255, 255, 255), anchor="rs")
     return img
 
 
@@ -662,8 +735,8 @@ SANDBOX_INTERVAL = 5  # seconds between looks for sandboxes that started
 
 # Runs inside a sandbox for as long as it has sessions. It reports each live
 # session's file, process and terminal times (see terminal_client()), and its
-# transcript's tail when that grew, then
-# waits for a line on its input; so it ends when the daemon does.
+# transcript's tail when that grew, then waits for a line on its input; so it
+# ends when the daemon does.
 # Every line of its own starts with the word passed as $1; other lines are transcript.
 PROBE = r"""
 n=$1
@@ -719,11 +792,10 @@ def watch_sandbox(kind, sandbox):
                 except ValueError:
                     session = None
             elif word == "stat" and isinstance(session, dict):
-                start = rest.rsplit(")", 1)[-1].split()[19:20]
-                if session.get("kind", "interactive") == "interactive" and session.get("sessionId") \
-                        and [str(session.get("procStart"))] == start:
-                    session.update(hostPid=None, sandbox=(kind, sandbox),
-                                   key=f"{kind.name}:{sandbox}:{session.get('pid')}:{start[0]}")
+                fields = stat_fields(rest)
+                if fields and is_session(session, fields[2]):
+                    session.update(sandbox=(kind, sandbox),
+                                   key=f"{kind.name}:{sandbox}:{session.get('pid')}:{fields[2]}")
                     sessions[session["key"]] = session
             elif word == "tty" and isinstance(session, dict):
                 try:
@@ -776,7 +848,7 @@ def processes(program):
         if not entry.isdigit():
             continue
         try:
-            args = open(f"/proc/{entry}/cmdline").read().split("\0")
+            args = read_proc(entry, "cmdline").split("\0")
         except OSError:
             continue
         if os.path.basename(args[0]) == program:
@@ -799,20 +871,18 @@ def terminal_times(path):
     return (st.st_atime, st.st_mtime) if stat.S_ISCHR(st.st_mode) else None
 
 
-def terminal_client(program, times, likely=lambda pid, args, start: True):
+def terminal_client(program, times, likely):
     """Pid of the `program` process in a terminal through which the user works in a session.
 
     `times` are the terminal_times() of the session's own terminal. Without a
-    process whose terminal has these, it is the latest one that is `likely`."""
+    process whose terminal has these, it is the latest one for which
+    `likely(pid, arguments, start time)` holds."""
     exact, exact_off, guess, guess_start = None, TERMINAL_SLACK, None, -1
     for pid, args in processes(program):
-        try:
-            fields = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
-            parent, tty, start = int(fields[1]), fields[4], int(fields[19])
-        except (OSError, IndexError, ValueError):
+        parent, tty, start = proc_stat(pid) or (0, "0", "")
+        if tty == "0" or parent == os.getpid():  # gone, not in a terminal, or a probe of ours
             continue
-        if tty == "0" or parent == os.getpid():  # not in a terminal, or a probe of ours
-            continue
+        start = int(start)
         own = terminal_times(f"/proc/{pid}/fd/0")
         if times and own and len(times) == 2:
             off = abs(own[0] - times[0]) + abs(own[1] - times[1])
@@ -837,10 +907,7 @@ def ancestors(pid):
     chain = []
     while pid and pid > 1:
         chain.append(pid)
-        try:
-            pid = int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[1])
-        except (OSError, ValueError):
-            break
+        pid = (proc_stat(pid) or (0,))[0]
     return chain
 
 
@@ -1083,7 +1150,7 @@ def session_chain(session):
     if session.get("sandbox"):
         return ancestors(sandbox_client(session))
     chain = ancestors(session["hostPid"])
-    if session["hostPid"] != session.get("pid"):  # containerised
+    if session.get("container"):
         chain += ancestors(docker_client(session))
     return chain
 
@@ -1105,18 +1172,14 @@ def list_windows():
 
 # All windows of an IDE share one process, so the window focused when a session
 # starts or gets a prompt is remembered as that session's.
-_learned = None  # "hostPid:procStart" -> {"backend": name, "id": window id}
-
-
-def process_key(session):
-    return session.get("key") or f"{session['hostPid']}:{proc_start(session['hostPid'])}"
+_learned = None  # session["key"] -> {"backend": name, "id": window id}
 
 
 def learned_windows():
     global _learned
     if _learned is None:
         try:
-            _learned = json.load(open(WINDOWS_FILE))
+            _learned = read_json(WINDOWS_FILE)
         except (OSError, ValueError):
             _learned = {}
     return _learned
@@ -1131,9 +1194,9 @@ def learn_window(session, live_keys):
         return
     learned = learned_windows()
     entry = {"backend": backend.name, "id": focused[0]["id"]}
-    if learned.get(process_key(session)) == entry:
+    if learned.get(session["key"]) == entry:
         return
-    learned[process_key(session)] = entry
+    learned[session["key"]] = entry
     for key in set(learned) - live_keys:  # forget ended sessions
         del learned[key]
     try:
@@ -1155,7 +1218,7 @@ def find_window(session, chain, title=None):
     for window in windows:
         if title and window.get("title") == title and window.get("pid") in chain:
             return backend, window, notes
-    learned = learned_windows().get(process_key(session))
+    learned = learned_windows().get(session["key"])
     if learned and learned["backend"] == backend.name:
         for window in windows:
             if window["id"] == learned["id"]:
@@ -1245,7 +1308,8 @@ def focus(session):
 
 # ------------------------------------------------------------------ main ---
 
-def key_info(session, state, since):
+def key_info(session, state, since, offset):
+    """What render() draws a session's key from; `offset` shifts when its mascot appears."""
     meta = transcript_info(session)
     if state == "busy":
         activity = meta.get("tool") or "thinking"
@@ -1262,7 +1326,20 @@ def key_info(session, state, since):
         "model": fmt_model(meta.get("model")),
         "context": tokens / CONTEXT_WINDOW,
         "elapsed": fmt_duration(time.time() - since),
+        "offset": offset,
     }
+
+
+def attempt(action, *args):
+    """Run a step that only serves finding windows: if it fails, the keys still have to be drawn."""
+    try:
+        action(*args)
+    except Exception as e:
+        log(f"{action.__name__} failed: {e!r}")
+
+
+SCAN_INTERVAL = 0.25  # seconds between looks at the sessions: often, to catch records before they are overwritten
+JUST_STARTED = 15     # seconds after its start in which a session's window is taken to have the focus
 
 
 def run(deck):
@@ -1271,21 +1348,21 @@ def run(deck):
     since = {}              # session -> epoch seconds the status was entered
     unseen = set()          # sessions that finished and were not visited yet
     infos = [None] * KEYS
-    next_frame = next_scan = 0.0
+    next_frame = next_scan = usage_until = 0.0
     sessions = {}
     while True:
         for key in deck.poll_presses(max(0.0, next_frame - time.monotonic())):
             sid = slots[key]
             if sid in sessions:
                 unseen.discard(sid)
-                focus(sessions[sid])
+                attempt(focus, sessions[sid])
                 next_scan = 0.0
         now = time.monotonic()
         if now < next_frame:
             continue
 
         if now >= next_scan:
-            next_scan = now + 0.25  # often, to catch records before they are overwritten
+            next_scan = now + SCAN_INTERVAL
             sessions = load_sessions()
             for sid in set(last_status) - set(sessions):  # ended sessions
                 unseen.discard(sid)
@@ -1304,27 +1381,29 @@ def run(deck):
                     continue
                 session = sessions[sid]
                 status = session.get("status", "?")
-                if status != last_status.get(sid):
-                    previous = last_status.get(sid)
+                previous = last_status.get(sid)
+                if status != previous:
                     if status == "idle" and previous == "busy":
                         unseen.add(sid)
                     # A session that just started or got a prompt has the focus now.
                     just_started = previous is None and \
-                        time.time() - (session.get("startedAt") or 0) / 1000 < 15
+                        time.time() - (session.get("startedAt") or 0) / 1000 < JUST_STARTED
                     if just_started or (status == "busy" and previous in ("idle", "waiting")):
-                        learn_window(session, {process_key(s) for s in sessions.values()})
+                        attempt(learn_window, session, set(sessions))
                     stamp = session.get("statusUpdatedAt") or session.get("startedAt")
                     since[sid] = stamp / 1000 if stamp else time.time()
                     last_status[sid] = status
                 if status != "idle":
                     unseen.discard(sid)
-                infos[key] = key_info(session, "done" if sid in unseen else status, since[sid])
-                infos[key]["offset"] = key * 7.3  # so keys don't show the mascot in sync
+                # The offset keeps the keys from showing the mascot in sync.
+                infos[key] = key_info(session, "done" if sid in unseen else status, since[sid], key * 7.3)
 
         animated = scrolling = False
         for key, info in enumerate(infos):
             if key == USAGE_KEY:
-                deck.set_image(key, render_usage())
+                if now >= usage_until:  # it shows nothing finer than seconds
+                    usage, usage_until = render_usage(), now + 1
+                deck.set_image(key, usage)
             elif info is None:
                 deck.set_image(key, BLANK)
             else:

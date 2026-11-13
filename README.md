@@ -134,7 +134,7 @@ In a virtual machine, the daemon starts a small shell script through the
 sandbox's own command (`sbx exec`) in each running sandbox. Once a second it
 reports the session files of live sessions and the end of a transcript that
 grew; nothing is stored on the host. The script ends when the sandbox has no
-session left or the daemon stops, and needs only `sh`, `wc` and `tail` inside.
+session left or the daemon stops, and needs only `sh`, `stat`, `wc` and `tail` inside.
 A sandbox that is stopped is not started.
 
 **The terminal of a sandboxed session.** Such a session has no parent process
@@ -254,6 +254,7 @@ The settings are constants at the top of `claude_session_deck.py`; change them a
 | `SAFE_BOTTOM` | `9` | Bottom pixels left empty because the keycap rim hides them |
 | `MASCOT_EVERY` | `25` | Seconds between appearances of the large creature |
 | `MASCOT_SECONDS` | `6` | How long it stays |
+| `MODEL_EVERY`, `MODEL_SECONDS` | `9`, `3` | The model replaces the name for 3 s every 9 s |
 | `MASCOT_ANIMATIONS` | walk 35, think 25, peek 20, wave 20 | Relative probability of each animation |
 | `FONT` | Ubuntu variable font | Font file used for all text |
 

@@ -7,6 +7,7 @@ app_dir="$HOME/.local/share/claude-session-deck"
 unit_dir="$HOME/.config/systemd/user"
 ext_uuid="claude-session-deck-windows@local"
 ext_dir="$HOME/.local/share/gnome-shell/extensions/$ext_uuid"
+python=/usr/bin/python3  # the interpreter the service runs with, so the checks below hold for it
 
 info() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -63,18 +64,19 @@ pkg_install() {
 
 is_gnome() { command -v gnome-shell >/dev/null && [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]]; }
 is_kde_wayland() { [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* && "${XDG_SESSION_TYPE:-}" == wayland ]]; }
-has_pillow() { python3 -c 'import PIL' 2>/dev/null; }
-has_gi() { python3 -c 'import gi; gi.require_version("Gio", "2.0")' 2>/dev/null; }
+has_pillow() { "$python" -c 'from PIL import ImageFont; ImageFont.Layout' 2>/dev/null; }  # Layout: Pillow 9.1
+has_gi() { "$python" -c 'import gi; gi.require_version("Gio", "2.0")' 2>/dev/null; }
 
 # --- dependencies ------------------------------------------------------------
 command -v systemctl >/dev/null || die "systemd (systemctl --user) is required"
-command -v python3 >/dev/null || pkg_install "Python 3" "$(pkg_name python3 python3 python python3)" ||
+[ -x "$python" ] || pkg_install "Python 3" "$(pkg_name python3 python3 python python3)" ||
     die "python3 is required"
-python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || die "Python 3.8 or newer is required"
+[ -x "$python" ] || die "$python is required: the service runs with it"
+"$python" -c 'import sys; sys.exit(sys.version_info < (3, 8))' || die "Python 3.8 or newer is required"
 
 has_pillow || pkg_install "the Python imaging library (Pillow)" \
     "$(pkg_name python3-pil python3-pillow python-pillow python3-Pillow)" || true
-has_pillow || die "the Python imaging library (Pillow) is required; install it and run this again"
+has_pillow || die "the Python imaging library (Pillow), 9.1 or newer, is required for $python; install it and run this again"
 
 if is_gnome && ! has_gi; then
     pkg_install "PyGObject, needed to focus windows on GNOME" \
@@ -133,7 +135,7 @@ hook_dir="$HOME/.claude/claude-session-deck"
 install -Dm755 "$here/statusline.sh" "$hook_dir/statusline.sh"
 # status_line_setup check|apply: prints configured, add, replace or unreadable
 status_line_setup() {
-    python3 - "$HOME/.claude/settings.json" "$hook_dir" "$1" <<'PY'
+    "$python" - "$HOME/.claude/settings.json" "$hook_dir" "$1" <<'PY'
 import json, os, sys
 path, hook_dir, mode = sys.argv[1:4]
 ours = "~/.claude/claude-session-deck/statusline.sh"
@@ -151,9 +153,12 @@ if mode == "check":
 if os.path.exists(path):
     with open(os.path.join(hook_dir, "settings.json.before-claude-session-deck"), "w") as backup:
         backup.write(open(path).read())
+original = os.path.join(hook_dir, "statusline-original")
 if current:  # keep the existing status line working behind ours
-    with open(os.path.join(hook_dir, "statusline-original"), "w") as original:
-        original.write(current)
+    with open(original, "w") as out:
+        out.write(current)
+elif os.path.exists(original):  # left by an earlier installation
+    os.remove(original)
 settings["statusLine"] = {**(settings.get("statusLine") or {}), "type": "command", "command": ours}
 os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path + ".tmp", "w") as out:
@@ -193,7 +198,7 @@ jetbrains_homes() {
 jetbrains_ides=""
 while read -r ide_home <&3; do
     # Plugins live in <vendor>/<product and version>, e.g. JetBrains/IntelliJIdea2026.3
-    read -r ide_data ide_name < <(python3 -c '
+    read -r ide_data ide_name < <("$python" -c '
 import json, sys
 info = json.load(open(sys.argv[1]))
 print(info["productVendor"] + "/" + info["dataDirectoryName"], info["name"])' "$ide_home/product-info.json") || continue
