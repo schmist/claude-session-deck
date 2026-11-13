@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .idea/
+jetbrains-plugin/.gradle/
+jetbrains-plugin/.intellijPlatform/
+jetbrains-plugin/.kotlin/
+jetbrains-plugin/build/

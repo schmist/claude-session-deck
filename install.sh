@@ -186,7 +186,14 @@ case "$status_line" in
 esac
 
 # --- JetBrains IDEs: select the session's terminal tab ------------------------
-# The plugin is built against each IDE found, with that IDE's own Java compiler.
+# The plugin is built against each IDE found, by Gradle running on the Java that IDE ships.
+# build_plugin <IDE home> <plugins directory>
+build_plugin() (
+    cd "$here/jetbrains-plugin"
+    [ ! -x "$1/jbr/bin/java" ] || export JAVA_HOME="$1/jbr"
+    ./gradlew --quiet installPlugin -Pide="$1" -Pplugins="$2"
+)
+
 jetbrains_homes() {
     {
         for exe in /proc/[0-9]*/exe; do readlink "$exe" 2>/dev/null; done | sed -n 's|/bin/[^/]*$||p'
@@ -206,10 +213,10 @@ print(info["productVendor"] + "/" + info["dataDirectoryName"], info["name"])' "$
     plugins_dir="${XDG_DATA_HOME:-$HOME/.local/share}/$ide_data"
     if [ -e "$plugins_dir/claude-session-deck" ] ||
         ask "Select the session's terminal tab in $ide_name? This builds a plugin and installs it to $plugins_dir"; then
-        if "$here/jetbrains-plugin/build.sh" "$ide_home" "$plugins_dir"; then
+        if build_plugin "$ide_home" "$plugins_dir"; then
             jetbrains_ides+="${jetbrains_ides:+, }$ide_name"
         else
-            warn "could not build the plugin for $ide_name; its terminal may be too old"
+            warn "could not build the plugin for $ide_name: its terminal may be too old, or Gradle could not download what it needs"
         fi
     fi
 done 3< <(jetbrains_homes)

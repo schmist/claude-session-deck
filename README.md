@@ -16,6 +16,49 @@ by the daemon's own code and shown pixel for pixel, at 72 × 72 px each.*
 
 Not affiliated with Anthropic or Elgato.
 
+## What it does, and what it does not
+
+It does:
+
+- Show each interactive Claude Code session of your user on a key: on this
+  machine, in containers and in Docker Sandboxes. See
+  [How sessions are found and read](#how-sessions-are-found-and-read).
+- Show per session its state, name, running tool, context size, model and the
+  time in that state, and for the account its usage limits.
+- Jump to a session's window when its key is pressed, on the
+  [desktops](#jumping-to-a-session) it knows, and to its terminal tab in
+  JetBrains IDEs.
+- Drive several decks of different [models](#decks) at once, real or emulated.
+- Take [plugins](#extending) for other places to find sessions, other
+  desktops, other terminals and IDEs, other sandboxes and other deck models.
+
+It does not:
+
+- **Control a session.** It only reads. It cannot answer a permission prompt,
+  send a prompt, or start, stop or interrupt a session.
+- **Use the network.** It makes no request to Anthropic or anyone else and
+  needs no login or API key; everything comes from files and processes on your
+  machine.
+- **See other sessions than those above**: not those on other machines or in
+  the cloud, not other users', and not non-interactive runs such as `claude -p`
+  or subagents. On this machine it looks in `~/.claude` only; a session started
+  with another `CLAUDE_CONFIG_DIR` needs a [one-line plugin](#extending).
+- **Show more sessions than a deck has keys.** The oldest are shown, the rest
+  are left out, and there are no pages.
+- **Select the tab or pane** in anything but a JetBrains IDE. Elsewhere it
+  raises the window, and may pick the wrong one of several: see the
+  [limits](#which-window-is-chosen). Inside `tmux` or `screen` a session's
+  processes do not lead to a terminal window at all, so the window can only be
+  found by its title.
+- **Share a deck.** It takes all keys of every deck it finds; there are no
+  other actions, profiles or folders, and other Stream Deck software must not
+  run next to it.
+- **Run on anything but Linux** with systemd user services.
+- **Promise to keep working.** It reads files that are internal to Claude Code
+  and may change with any update; and of the decks only the MK.2, of the
+  desktops only GNOME on Wayland and of the tools only IntelliJ IDEA were tried
+  for real.
+
 ## What the keys show
 
 | Part | Meaning |
@@ -61,7 +104,7 @@ lights up again when the computer wakes.
 - One or more Stream Decks of a [model it knows](#decks), or the [emulator](#emulated-decks)
 - Python 3.8+ with Pillow
 - To notice a locked screen or sleep: PyGObject and systemd's login manager
-- To jump to windows: a supported desktop, see [Jumping to a window](#jumping-to-a-window)
+- To jump to windows: a supported desktop, see [Jumping to a session](#jumping-to-a-session)
 - Optional: the Ubuntu font; the fallback font is wider, so more text gets shortened
 
 Developed on Ubuntu with GNOME Shell 50 on Wayland and a Stream Deck MK.2;
@@ -117,28 +160,38 @@ sudo udevadm control --reload
 sudo udevadm trigger --subsystem-match=hidraw
 ```
 
-## How it works
+## How sessions are found and read
 
-**Session state.** Claude Code keeps one file per running session in
-`~/.claude/sessions/<pid>.json` with its name, folder and status. The daemon
-reads these four times a second and drops sessions whose process is gone. The
-tool name and context size come from the end of the session's transcript in
-`~/.claude/projects/`. These files are internal to Claude Code, so an update
-can break claude-session-deck.
+The daemon runs as your user and reads what your user may read anyway. It
+never writes to a session, its files or its terminal.
 
-**Account usage.** Claude Code passes the account's usage limits to its status
-line command. The installer registers `statusline.sh` as that command; it
-saves the data for the daemon and then runs the status line you had before, if
-any. The uninstaller restores the previous setting, and a copy of your earlier
-settings is kept in `~/.claude/claude-session-deck/settings.json.before-claude-session-deck`.
-
-**Sessions in sandboxes.** How a session is found depends on what the host
-can see of its sandbox:
-
-| Sandbox | What the host sees | How the session is found |
+| What | Read from | How often |
 |---|---|---|
-| Container (Docker, Podman, …) | The process, and its files under `/proc/<pid>/root` | The daemon reads the session file and transcript the container sees, whether it keeps its own `~/.claude` or mounts the host's |
-| Virtual machine ([Docker Sandboxes](https://docs.docker.com/ai/sandboxes/), `sbx`) | Nothing | A script run inside the sandbox reports its sessions |
+| Which sessions run, and each one's name, folder, state and what it waits for | The file Claude Code keeps per running session, `~/.claude/sessions/<pid>.json` | 4 times a second |
+| Whether a session is still alive | `/proc/<pid>/stat`: the process must exist and have started when the file says | 4 times a second |
+| Running tool, context size, model | The last 400 kB of the session's transcript, `~/.claude/projects/<folder>/<session id>.jsonl`, when it changed | 4 times a second |
+| Account usage | `~/.claude/claude-session-deck/status.json`, saved by the status line command (below) | Once a second |
+| The processes leading to a session's window | `/proc`: the session's parent processes | On a key press, and when a session starts or gets a prompt |
+
+Of a transcript the daemon keeps the name of the running tool, the token
+counts of the last reply and the model; the conversation itself is not kept,
+shown or logged. What it writes is the window it remembered for each session,
+in `~/.cache/claude-session-deck/windows.json`, and its log.
+
+These files are internal to Claude Code, so an update can break
+claude-session-deck.
+
+**Where sessions are found.** Each place is a *source*; the daemon asks all of
+them and shows what they find together:
+
+| Source | Finds sessions | How |
+|---|---|---|
+| `Local` | On this machine | The session files in `~/.claude/sessions/` |
+| `Containers` | In containers (Docker, Podman, …) | Every process named `claude` in another process namespace is looked up in `/proc`; its session file and transcript are read through `/proc/<pid>/root`, whether the container keeps its own `~/.claude` or mounts yours |
+| `Sandboxes` | In virtual machines ([Docker Sandboxes](https://docs.docker.com/ai/sandboxes/), `sbx`) | The host sees nothing of them, so a script run inside each sandbox reports its sessions |
+
+A session counts if its file says it is interactive, names a session ID and
+belongs to a live process. Another source is [a plugin](#extending).
 
 A container needs no setup, whatever started it, as long as its `claude`
 process runs as your user.
@@ -150,24 +203,15 @@ grew; nothing is stored on the host. The script ends when the sandbox has no
 session left or the daemon stops, and needs only `sh`, `stat`, `wc` and `tail` inside.
 A sandbox that is stopped is not started.
 
-**The terminal of a sandboxed session.** Such a session has no parent process
-on the host that leads to its window. What it reads and writes passes through
-a client process in your terminal instead, such as `sbx run` or `docker run`.
-The session's terminal inside the sandbox and the client's terminal on the
-host were therefore last typed into, and last written to, at the same moments;
-the daemon compares these times to tell which client, and so which window and
-tab, belongs to which session. This also holds for several sessions in one
-sandbox. If no client matches, it takes the latest one started for that
-sandbox or project folder.
-
-**Adding a kind of sandbox.** Anything that can run a command inside, such as
-`ssh` to another machine, is a subclass of `Sandbox` in
-`claude_session_deck.py`, listed in `SANDBOXES`: `running()` returns the names
-of the running sandboxes and `command(name)` the start of a command line that
-runs its remaining arguments inside one, as `["sbx", "exec", "-i", name]`
-does.
-
 **Sessions in the same folder** are labelled with the name Claude gave them.
+
+## How the rest works
+
+**Account usage.** Claude Code passes the account's usage limits to its status
+line command. The installer registers `statusline.sh` as that command; it
+saves the data for the daemon and then runs the status line you had before, if
+any. The uninstaller restores the previous setting, and a copy of your earlier
+settings is kept in `~/.claude/claude-session-deck/settings.json.before-claude-session-deck`.
 
 **Locked screen and sleep.** The login manager (logind) tells the daemon over
 D-Bus when a session of yours is locked and when the computer is about to
@@ -216,12 +260,7 @@ touch keys.
 The drawing is laid out for a key of 72 px and scaled to other sizes, with
 text drawn at the key's own size so that it stays sharp.
 
-**Adding a model.** A model is an entry in `MODELS` in
-`claude_session_deck.py`: its USB product IDs, columns, rows, key size and how
-an image is turned before it is sent. One with another protocol, a screen or
-other controls is a subclass of `Model`, as `MiniModel` and `PlusModel` are;
-its counterpart for the emulator is a subclass of `Firmware` in `emulator.py`.
-What a press, turn or touch does is decided in `act()`.
+Another model is [a plugin, or an entry in `MODELS`](#extending).
 
 ### Emulated decks
 
@@ -254,10 +293,33 @@ uses it, a second daemon started from the source folder gets none. To try
 changed code, stop the service first (`systemctl --user stop
 claude-session-deck`) or install the change with `./install.sh`.
 
-## Jumping to a window
+## Jumping to a session
+
+A key press is handled in three steps, each by a part that can be exchanged:
+
+| Step | Part | What it does |
+|---|---|---|
+| 1 | The session's *source* | Names the processes on this machine that lead to the session's window: its parent processes, up to the terminal or IDE |
+| 2 | A *tool*, if one of these processes is one | Brings the session to the front inside that program: selects its tab. See [Tools](#tools) |
+| 3 | The desktop's *backend* | Lists the windows, and raises the one that belongs to one of these processes |
+
+A session without a tool still gets its window raised, and one whose window is
+not found is reported in the log; neither stops the keys from being drawn.
+
+**A session in a container or sandbox** has no parent process on the host
+that leads to its window. What it reads and writes passes through a client
+process in your terminal instead, such as `sbx run` or `docker run`. The
+session's terminal inside and the client's terminal on the host were therefore
+last typed into, and last written to, at the same moments; the daemon compares
+these times to tell which client, and so which window and tab, belongs to
+which session. This also holds for several sessions in one sandbox. If no
+client matches, it takes the latest one started for that sandbox or project
+folder.
+
+### Desktops
 
 Linux has no single way to focus another program's window, so claude-session-deck uses
-the first of these mechanisms that sees any windows:
+the first of these backends that sees any windows:
 
 | Desktop | Mechanism | Needs |
 |---|---|---|
@@ -282,7 +344,7 @@ Both GNOME extensions add D-Bus calls that any program running as your user
 can use. The bundled one can only list and activate windows; Window Calls, a
 third-party project, can also move, resize and close them.
 
-**Which window is chosen:**
+### Which window is chosen
 
 1. The window the session's tool reports, if the tool is
    [supported](#tools).
@@ -301,7 +363,7 @@ Limits, where the session's tool is not supported:
   remembered for whichever window of its program has the focus, until your
   next prompt.
 
-## Tools
+### Tools
 
 Raising a window works for any terminal or IDE. For a tool the daemon knows,
 it can do more:
@@ -311,13 +373,16 @@ it can do more:
 | JetBrains IDEs (IntelliJ IDEA, PyCharm, Android Studio, …) | Selects the session's tab in the Terminal tool window and raises the right project window | The plugin from `jetbrains-plugin/`, the IDE's current terminal (not the Classic one) |
 
 **The JetBrains plugin** is built by `./install.sh` against each IDE it finds
-(running, or installed through Toolbox, in `/opt` or as a snap), using the
-Java compiler the IDE ships, and is loaded when the IDE next starts. A new
-major IDE version has its own plugin directory, so run `./install.sh` again
-after such an update. To build it by hand:
+(running, or installed through Toolbox, in `/opt` or as a snap), and is loaded
+when the IDE next starts. It is written in Kotlin and built by Gradle, which
+runs on the Java the IDE ships and compiles against that IDE, so no IDE is
+downloaded. The first build does download Gradle, its plugins and the Kotlin
+compiler. A new major IDE version has its own plugin directory, so run
+`./install.sh` again after such an update. To build it by hand:
 
 ```sh
-jetbrains-plugin/build.sh <IDE home> <plugins directory>
+cd jetbrains-plugin
+JAVA_HOME=<IDE home>/jbr ./gradlew installPlugin -Pide=<IDE home> -Pplugins=<plugins directory>
 ```
 
 The plugin listens on the socket
@@ -331,10 +396,94 @@ window and the daemon's log says why the tab was not selected.
 Developed against IntelliJ IDEA 2026.3; other IDEs are untested. Terminals opened as an editor tab
 are not selected.
 
-**Adding a tool.** A tool is a subclass of `Tool` in `claude_session_deck.py`,
-listed in `TOOLS`. `runs(pid)` tells whether a process is that tool, and is
-asked for each parent process of the session; `focus(pid, chain)` brings the
-session to the front inside it and may return the title of its window.
+Another tool is [a plugin](#extending).
+
+## Extending
+
+Five parts of the daemon are lists of objects, and each object is a small
+class. To add to one, write a subclass and append it to the list:
+
+| To support another | Subclass | Add it to | It has to say |
+|---|---|---|---|
+| Place where sessions are found | `Source` | `SOURCES` | `sessions()`: the live sessions there. Optionally `info(session)`: tool, tokens and model, if they do not come from a transcript on this machine; `chain(session)`: the processes that lead to its window, if they are not its parents |
+| Desktop, to list and raise windows | `Backend` | `BACKENDS` | `windows()`: the open windows with their process and title, or `None` on another desktop; `activate(id)`: raise one |
+| Terminal or IDE, to select the tab | `Tool` | `TOOLS` | `runs(pid)`: whether that process is this tool; `focus(pid, chain)`: bring the session to the front inside it, and return its window's title if known |
+| Sandbox that can run a command inside | `Sandbox` | `SANDBOXES` | `running()`: the names of the running ones; `command(name)`: the start of a command line that runs its remaining arguments inside, as `["sbx", "exec", "-i", name]` does |
+| Stream Deck model | `Model` | `MODELS` | Its USB product IDs, columns, rows and key size; a subclass for another protocol, a screen or other controls, as `MiniModel` and `PlusModel` are |
+
+The docstrings of these classes in `claude_session_deck.py` say exactly what
+each method gets and returns; the classes next to them (`Local`, `Sway`,
+`JetBrains`, `Sbx`) are short examples.
+
+**Plugins.** The daemon runs every `*.py` file in
+`~/.config/claude-session-deck/plugins/` when it starts, in alphabetical
+order, so nothing in the repository has to be changed and `./install.sh` does
+not overwrite it. A plugin imports the daemon as `claude_session_deck` and
+changes its lists:
+
+```python
+# ~/.config/claude-session-deck/plugins/mine.py
+import os
+import subprocess
+
+import claude_session_deck as csd
+
+
+# Sessions started with CLAUDE_CONFIG_DIR=~/.claude-work
+csd.SOURCES.append(csd.Local("~/.claude-work"))
+
+
+class MyTerminal(csd.Tool):
+    """Selects the session's tab in a terminal that can be told to."""
+
+    name = "my terminal"
+
+    def runs(self, pid):
+        # Asked for each parent process of the session, nearest first.
+        return csd.read_proc(pid, "comm").strip() == "my-terminal"
+
+    def focus(self, pid, chain):
+        # `chain` holds the session's parent processes; one of them is the
+        # shell in the tab to select. Raise an exception if it fails: the
+        # window is raised all the same.
+        ...
+
+
+csd.TOOLS.append(MyTerminal())
+
+
+class MyDesktop(csd.Backend):
+    """Lists and raises windows on a compositor the daemon does not know."""
+
+    name = "my desktop"
+
+    def windows(self):
+        if "MYDESKTOP" not in os.environ.get("XDG_CURRENT_DESKTOP", ""):
+            return None  # not this desktop: the next backend is asked
+        return [{"id": w["id"], "pid": w["pid"], "title": w["title"], "focus": w["focused"]}
+                for w in csd.run_json("my-desktop-msg", "windows", "--json")]
+
+    def activate(self, wid):
+        subprocess.run(["my-desktop-msg", "focus", str(wid)], timeout=3)
+
+
+csd.BACKENDS.insert(0, MyDesktop())  # asked before the built-in ones
+```
+
+After a change, restart the daemon: `systemctl --user restart
+claude-session-deck`. Its log names each plugin it loaded, and why one could
+not be loaded; a source that fails is reported once and the other sources
+carry on. `./uninstall.sh` leaves the plugins folder alone.
+
+A plugin is ordinary Python that runs with the daemon's rights, which are
+yours: only put files there that you would run yourself. The names it uses
+from the daemon are not a stable interface yet and can change with an update.
+
+What is not a list, such as what a key shows or what a press, turn or touch
+does (`render()`, `act()`), is changed in the source.
+
+For a new model, the emulator needs its counterpart, a subclass of `Firmware`
+in `emulator.py`.
 
 ## Configuration
 
@@ -375,4 +524,5 @@ journalctl --user -u claude-session-deck -f     # log
 | Log shows `no window found for …` | The line lists each mechanism tried; none applies to your desktop, or no window matches the session |
 | The wrong terminal tab stays selected in a JetBrains IDE | The plugin is not loaded: run `./install.sh`, then restart the IDE. If the log shows `JetBrains IDE: cannot focus …`, see the IDE's own log (Help → Show Log) |
 | Usage key reads `no data yet` | The status line command is not set up (run `./install.sh` again), no session has been active since, or the account has no usage limits |
-| A session is missing | It is not interactive, or it runs in a sandbox the daemon cannot look into: a container whose process is not yours, or a [kind of sandbox](#how-it-works) it does not know |
+| A session is missing | It is not interactive, it uses another `CLAUDE_CONFIG_DIR`, or it runs where no [source](#how-sessions-are-found-and-read) looks: a container whose process is not yours, a kind of sandbox the daemon does not know, another machine. The deck may also have fewer keys than there are sessions |
+| Log shows `cannot load plugin …` or `…: cannot look for sessions: …` | A [plugin](#extending) failed; the line says why |
