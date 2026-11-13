@@ -2,7 +2,6 @@
 """Show one Stream Deck key per running Claude Code session; a key press focuses its window."""
 import ctypes
 import ctypes.util
-import datetime
 import fcntl
 import glob
 import io
@@ -38,10 +37,9 @@ CONTEXT_WINDOW = 1_000_000  # tokens at which the context bar is full
 SAFE_BOTTOM = 9             # bottom pixels hidden by the keycap rim
 MASCOT_EVERY = 25           # seconds between mascot appearances while working
 MASCOT_SECONDS = 6          # how long it stays
-MODEL_EVERY, MODEL_SECONDS = 9, 3  # the model replaces the small creature for 3 s every 9 s
+MODEL_EVERY, MODEL_SECONDS = 9, 3  # the model replaces the session's name for 3 s every 9 s
 FONT = "/usr/share/fonts/truetype/ubuntu/Ubuntu[wdth,wght].ttf"
 FALLBACK_FONT = "sans:bold"  # fontconfig pattern, used if FONT is missing
-BOOT_TIME = time.time() - float(open("/proc/uptime").read().split()[0])
 
 
 def log(*args):
@@ -140,7 +138,7 @@ def load_sessions():
             continue
         if s.get("kind", "interactive") != "interactive" or not s.get("sessionId"):
             continue
-        # A file from another pid namespace mixes the fields of all containers: see below.
+        # A file from another pid namespace belongs to a container: see below.
         domain = re.search(r"pid:\[\d+\]", s.get("pidDomain", ""))
         start = str(s.get("procStart"))
         if (domain and domain[0] != own_ns) or proc_start(s.get("pid")) != start:
@@ -161,8 +159,7 @@ def load_sessions():
 
 
 def container_sessions(own_ns):
-    """Claude processes in containers, described from their transcripts."""
-    # They are all pid 1 and patch the same session file, so that file cannot tell them apart.
+    """Sessions of Claude processes in containers, from the session file each container sees."""
     found = {}
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -176,60 +173,19 @@ def container_sessions(own_ns):
             if ns == own_ns or tty == "0" \
                     or open(f"/proc/{parent}/comm").read().strip() == "claude":
                 continue
-            cwd = os.readlink(f"/proc/{entry}/cwd")
-        except (OSError, IndexError):
+            env = dict(v.split("=", 1) for v in open(f"/proc/{entry}/environ").read().split("\0") if "=" in v)
+            inner = env.get("CLAUDE_CONFIG_DIR") or os.path.join(env.get("HOME", "/"), ".claude")
+            config = f"/proc/{entry}/root/{inner.lstrip('/')}"  # the container's files, as the host sees them
+            inner_pid = re.search(r"^NSpid:.*?(\d+)$", open(f"/proc/{entry}/status").read(), re.M)[1]
+            s = json.load(open(os.path.join(config, "sessions", inner_pid + ".json")))
+        except (OSError, ValueError, TypeError, IndexError):
             continue
-        own = container_own_session(entry, start)
-        if own:
-            found[int(entry), start] = own
+        if s.get("kind", "interactive") != "interactive" or not s.get("sessionId") \
+                or str(s.get("procStart")) != start:
             continue
-        started = (BOOT_TIME + int(start) / os.sysconf("SC_CLK_TCK")) * 1000
-        s = {"sessionId": container_session_id(entry), "pid": None, "hostPid": int(entry),
-             "cwd": cwd, "status": "unknown", "startedAt": started}
-        if s["sessionId"]:
-            meta = transcript_info(s)
-            s.update(status=meta.get("status", "idle"), waitingFor="input needed",
-                     statusUpdatedAt=meta.get("since", started),
-                     name=meta.get("custom-title") or meta.get("ai-title"),
-                     nameSource="user" if meta.get("custom-title") else "derived")
+        s.update(hostPid=int(entry), projects=os.path.join(config, "projects"))
         found[int(entry), start] = s
     return found
-
-
-def container_own_session(pid, start):
-    """Session of a containerised process, from the container's own Claude folder.
-
-    None if the container uses the host's folder, or the file cannot be read."""
-    try:
-        env = dict(v.split("=", 1) for v in open(f"/proc/{pid}/environ").read().split("\0") if "=" in v)
-        inner = env.get("CLAUDE_CONFIG_DIR") or os.path.join(env.get("HOME", "/"), ".claude")
-        config = f"/proc/{pid}/root/{inner.lstrip('/')}"  # the container's files, as the host sees them
-        if os.path.samefile(config, os.path.dirname(SESSIONS_DIR)):
-            return None
-        inner_pid = re.search(r"^NSpid:.*?(\d+)$", open(f"/proc/{pid}/status").read(), re.M)[1]
-        s = json.load(open(os.path.join(config, "sessions", inner_pid + ".json")))
-    except (OSError, ValueError, TypeError):
-        return None
-    if s.get("kind", "interactive") != "interactive" or not s.get("sessionId") \
-            or str(s.get("procStart")) != start:
-        return None
-    s.update(hostPid=int(pid), projects=os.path.join(config, "projects"))
-    return s
-
-
-def container_session_id(pid):
-    """Id of the session a containerised process runs, named by a folder in its /tmp."""
-    def recency(folder):  # the session written to last is the current one
-        slug, sid = folder.split("/")[-2:]
-        times = []
-        for path in (os.path.join(PROJECTS_DIR, slug, sid + ".jsonl"), folder):
-            try:
-                times.append(os.stat(path).st_mtime)
-            except OSError:
-                times.append(0)
-        return times
-    folders = glob.glob(f"/proc/{pid}/root/tmp/claude-*/*/*-*-*-*-*")
-    return os.path.basename(max(folders, key=recency)) if folders else ""
 
 
 def label(session):
@@ -247,11 +203,10 @@ TRANSCRIPT_TAIL = 400_000  # bytes read from the end
 # What Claude Code records when /model switches the model, e.g. "Set model to `Opus 5.5`".
 # Only a name with a version counts: "Default" says nothing until the next reply.
 MODEL_SWITCH = re.compile(r'"text":\s*"<local-command-stdout>Set model to `([^`]*\d[^`]*)`')
-TITLE_FIELDS = {"custom-title": "customTitle", "ai-title": "aiTitle"}  # entry type -> field
 
 
 def transcript_info(session):
-    """Context size, current tool, titles and state, read from the transcript tail."""
+    """Context size, model and current tool, read from the transcript tail."""
     if "meta" in session:  # read inside its sandbox, see watch_sandbox()
         return session["meta"]
     sid = session["sessionId"]
@@ -283,14 +238,12 @@ def transcript_info(session):
 def parse_transcript(lines, previous):
     """Info from the last `lines` of a transcript; `previous` is what an earlier read gave."""
     info = dict(previous)  # keep values the tail no longer has
-    for key in ("tool", "status", "since"):
-        info.pop(key, None)
+    info.pop("tool", None)
     seen_turn = seen_usage = switched = False
-    titles = set()
     for line in reversed(lines):
-        if seen_usage and '-title"' not in line:
-            continue
-        switch = not seen_usage and not switched and MODEL_SWITCH.search(line)
+        if seen_usage:
+            break
+        switch = not switched and MODEL_SWITCH.search(line)
         if switch:  # a /model command newer than the last reply
             info["model"], switched = switch[1], True
         try:
@@ -298,35 +251,18 @@ def parse_transcript(lines, previous):
         except ValueError:
             continue
         kind = entry.get("type")
-        if kind in TITLE_FIELDS:
-            if kind not in titles:
-                titles.add(kind)
-                info[kind] = entry.get(TITLE_FIELDS[kind])
-            continue
         if entry.get("isSidechain") or entry.get("isMeta") or kind not in ("assistant", "user"):
             continue
         msg = entry.get("message") or {}
-        if not seen_turn:
+        if not seen_turn:  # the last turn: a reply that is not finished names the running tool
             seen_turn = True
             content = msg.get("content")
-            blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
-            tools = [b.get("name") or "" for b in blocks if b.get("type") == "tool_use"]
-            text = content if isinstance(content, str) else "".join(b.get("text") or "" for b in blocks)
-            if kind == "user":
-                info["status"] = "idle" if text.startswith("[Request interrupted") else "busy"
-            elif msg.get("stop_reason") not in (None, "tool_use"):
-                info["status"] = "idle"
-            else:
-                info["status"] = "waiting" if tools[-1:] in (["AskUserQuestion"], ["ExitPlanMode"]) else "busy"
-                if tools:
-                    info["tool"] = tools[-1].split("__")[-1]
-            try:
-                stamp = entry.get("timestamp", "").replace("Z", "+00:00")
-                info["since"] = datetime.datetime.fromisoformat(stamp).timestamp() * 1000
-            except ValueError:
-                pass
+            tools = [b.get("name") or "" for b in content if isinstance(b, dict) and b.get("type") == "tool_use"] \
+                if isinstance(content, list) else []
+            if kind == "assistant" and msg.get("stop_reason") in (None, "tool_use") and tools:
+                info["tool"] = tools[-1].split("__")[-1]
         usage = msg.get("usage")
-        if not seen_usage and kind == "assistant" and usage:
+        if kind == "assistant" and usage:
             seen_usage = True
             if not str(msg.get("model") or "<").startswith("<") and not switched:  # "<synthetic>" is no model's reply
                 info["model"] = msg["model"]
@@ -347,11 +283,11 @@ def fmt_duration(seconds):
 
 
 def fmt_model(model):
-    """Short form of a model: family initial and version, "claude-opus-5-5" or "Opus 5.5" -> "O5.5"."""
+    """Readable name of a model: "claude-opus-5-5" or "Opus 5.5" -> "Opus 5.5"."""
     parts = re.split(r"[-\s.]", model or "")
     family = [p for p in parts if p.isalpha() and p != "claude"]
     version = [p for p in parts if p.isdigit() and len(p) < 3]  # not a date
-    return family[0][0].upper() + ".".join(version[:2]) if family else ""
+    return f"{family[0].capitalize()} {'.'.join(version[:2])}".strip() if family else ""
 
 
 def fmt_tokens(n):
@@ -416,16 +352,21 @@ def fit(text, fnt, width):
     return text.rstrip("-_ /.") + "…"
 
 
-NAME_SIZES = (16, 15, 14, 13, 12, 11, 10)  # font sizes tried in turn for the name
+NAME_SIZE = 15  # font size of the name; the widest model name, "Sonnet 5.5", just fits
+SCROLL_FPS = 6  # frames per second while only names scroll
 
 
-def fit_name(name):
-    """The name and the largest font size at which it fits on one line, shortened if none does."""
-    width = SIZE - 8
-    for size in NAME_SIZES:
-        if font(size).getlength(name) <= width:
-            return name, size
-    return fit(name, font(size), width), size
+def name_scroll(name, t):
+    """(pixels a name too wide for its key is moved left at time `t`, whether it is moving).
+
+    Each time the name appears it rests for a second, moves until its end shows and rests there."""
+    over = font(NAME_SIZE).getlength(name) - (SIZE - 8)
+    if over <= 0:
+        return 0, False
+    shown = MODEL_EVERY - MODEL_SECONDS            # seconds the name is shown for
+    moves = min(over / 16, shown - 2)              # at 16 px a second, faster if that takes too long
+    done = (t % MODEL_EVERY - 1) / moves
+    return round(over * min(1, max(0, done))), 0 < done < 1
 
 
 MASCOT_COLOR = (217, 119, 87)
@@ -553,15 +494,17 @@ def render(info, t):
         rng = random.Random(f"{info.get('offset', 0)}:{(t + info.get('offset', 0)) // MASCOT_EVERY}")
         kind = rng.choices(list(MASCOT_ANIMATIONS), weights=MASCOT_ANIMATIONS.values())[0]
 
-    # Now and then the model takes the place of the small creature, on all keys at once.
+    # Now and then the model takes the place of the session's name, on all keys at once.
     show_model = bool(info.get("model")) and t % MODEL_EVERY >= MODEL_EVERY - MODEL_SECONDS
 
     big = SIZE * SS
     img = Image.composite(Image.new("RGB", (big, big), mix(BASE, accent, tint)),
                           Image.new("RGB", (big, big), BASE), _gradient)
     g = ImageDraw.Draw(img)
-    name, size = fit_name(info["name"])
-    name_bottom = 5 + size
+    name_font = font(NAME_SIZE)
+    name = fit(info["model"], name_font, SIZE - 8) if show_model else info["name"]
+    shift = name_scroll(name, t)[0]
+    name_bottom = 5 + NAME_SIZE
     small = font(10, "Condensed Medium")
     time_y = SIZE - SAFE_BOTTOM - 9   # centre of the time row
     bar_y = time_y - 14               # centre of the context bar
@@ -579,8 +522,7 @@ def render(info, t):
     if mascot is not None:
         draw_mascot(g, kind, mascot, name_bottom + 2, SIZE - SAFE_BOTTOM)
     else:
-        if not show_model:
-            draw_icon(g, state, 4, time_y - round(MASCOT_ROWS * ICON_PX / 2), accent, t)
+        draw_icon(g, state, 4, time_y - round(MASCOT_ROWS * ICON_PX / 2), accent, t)
         if info.get("tokens"):
             x2 = (SIZE - 4 - small.getlength(info["tokens"]) - 4) * SS
             box = (4 * SS, (bar_y - 2) * SS, x2, (bar_y + 2) * SS)
@@ -596,10 +538,18 @@ def render(info, t):
     dim = (150, 156, 168) if state != "idle" else (110, 116, 128)
     soft = mix(accent, (255, 255, 255), 0.25)
     color = (255, 255, 255) if state != "idle" else (190, 195, 205)
-    if mascot is not None:  # centred like the mascot below it
-        d.text((SIZE / 2, 5), name, font=font(size), fill=color, anchor="ma")
+    if show_model:  # tinted, to tell it from the name
+        color = mix(accent, color, 0.35)
+    # The name is drawn on its own strip, which cuts off what is scrolled out of it.
+    box = (4, 0, SIZE - 4, name_bottom + 4)
+    strip = img.crop(box)
+    if mascot is not None and name_font.getlength(name) <= SIZE - 8:  # centred like the mascot below it
+        ImageDraw.Draw(strip).text((strip.width / 2, 5), name, font=name_font, fill=color, anchor="ma")
+    else:
+        ImageDraw.Draw(strip).text((-shift, 5), name, font=name_font, fill=color)
+    img.paste(strip, box)
+    if mascot is not None:
         return img
-    d.text((4, 5), name, font=font(size), fill=color)
     big_font = font(18)
     time_x = 4 + round(MASCOT_COLS * ICON_PX) + 3
     d.text((time_x, time_y), info["elapsed"], font=big_font,
@@ -607,9 +557,6 @@ def render(info, t):
     if info.get("activity"):
         line = font(11, "Condensed Medium")
         d.text((4, name_bottom + 1), fit(info["activity"], line, SIZE - 8), font=line, fill=soft)
-    if show_model:  # in the place of the small creature
-        d.text((4 + MASCOT_COLS * ICON_PX / 2, time_y), info["model"], font=font(11),
-               fill=mix(accent, (255, 255, 255), 0.3), anchor="mm")
     d.text((SIZE - 4, bar_y), info.get("tokens", ""), font=small, fill=dim, anchor="rm")
     return img
 
@@ -1304,8 +1251,6 @@ def key_info(session, state, since):
         activity = meta.get("tool") or "thinking"
     elif state == "waiting":
         activity = session.get("waitingFor") or ""
-    elif state == "unknown":
-        activity = "no status yet"
     else:
         activity = ""  # colour and icon already say idle / done
     tokens = meta.get("tokens") or 0
@@ -1316,7 +1261,7 @@ def key_info(session, state, since):
         "tokens": fmt_tokens(tokens),
         "model": fmt_model(meta.get("model")),
         "context": tokens / CONTEXT_WINDOW,
-        "elapsed": fmt_duration(time.time() - since) if state != "unknown" else "?",
+        "elapsed": fmt_duration(time.time() - since),
     }
 
 
@@ -1376,7 +1321,7 @@ def run(deck):
                 infos[key] = key_info(session, "done" if sid in unseen else status, since[sid])
                 infos[key]["offset"] = key * 7.3  # so keys don't show the mascot in sync
 
-        animated = False
+        animated = scrolling = False
         for key, info in enumerate(infos):
             if key == USAGE_KEY:
                 deck.set_image(key, render_usage())
@@ -1384,8 +1329,9 @@ def run(deck):
                 deck.set_image(key, BLANK)
             else:
                 animated |= info["state"] in ANIMATED
+                scrolling |= name_scroll(info["name"], now)[1]
                 deck.set_image(key, render(info, now))
-        next_frame = now + (1 / FPS if animated else 0.5)
+        next_frame = now + (1 / FPS if animated else 1 / SCROLL_FPS if scrolling else 0.5)
 
 
 def main():

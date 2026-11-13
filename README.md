@@ -20,11 +20,11 @@ Not affiliated with Anthropic or Elgato.
 | Part | Meaning |
 |---|---|
 | Top bar and colour | Session state (see below) |
-| Name | Project folder, or the session name if you renamed it |
+| Name | Project folder, or the session name if you renamed it; a name too long for the key scrolls to its end each time it appears |
 | Line under the name | While working: the running tool (`Bash`, `Edit`, …) or `thinking`. While waiting: the reason |
 | Bar and number | Context used, in tokens, on a 1M scale; amber above 65%, red above 85% |
 | Creature and time | How long the session has been in its current state |
-| Code in the creature's place, e.g. `O5.5` | The session's model: initial of its family and its version, so `claude-opus-5-5` is `O5.5`. It replaces the small creature for 3 s every 9 s, on all keys at once |
+| Model in the name's place, e.g. `Opus 5.5` | The session's model. It replaces the name, in a tinted colour, for 3 s every 9 s, on all keys at once |
 
 | State | Colour | Animation |
 |---|---|---|
@@ -123,17 +123,11 @@ can see of its sandbox:
 
 | Sandbox | What the host sees | How the session is found |
 |---|---|---|
-| Container that keeps its own `~/.claude` (Docker, Podman, …) | The process, and its files under `/proc/<pid>/root` | The daemon reads the session file and transcript inside the container |
-| Container that mounts the host's `~/.claude` | The same, but all such sessions have process ID 1 and so share one session file | The daemon finds the processes itself and derives name and state from each transcript |
+| Container (Docker, Podman, …) | The process, and its files under `/proc/<pid>/root` | The daemon reads the session file and transcript the container sees, whether it keeps its own `~/.claude` or mounts the host's |
 | Virtual machine ([Docker Sandboxes](https://docs.docker.com/ai/sandboxes/), `sbx`) | Nothing | A script run inside the sandbox reports its sessions |
 
 A container needs no setup, whatever started it, as long as its `claude`
-process runs as your user. For the shared `~/.claude`, deriving the state has
-two consequences:
-
-- A permission prompt shows as working, not as needing you; questions and
-  plan approvals are recognised.
-- A session whose transcript cannot be found reads `no status yet`.
+process runs as your user.
 
 In a virtual machine, the daemon starts a small shell script through the
 sandbox's own command (`sbx exec`) in each running sandbox. Once a second it
@@ -159,8 +153,7 @@ of the running sandboxes and `command(name)` the start of a command line that
 runs its remaining arguments inside one, as `["sbx", "exec", "-i", name]`
 does.
 
-**Sessions in the same folder** are labelled with the name Claude gave them;
-in a container sharing the host's `~/.claude`, with the session's title.
+**Sessions in the same folder** are labelled with the name Claude gave them.
 
 **The deck.** The daemon writes JPEG images straight to the device and reads
 key presses from it, without a Stream Deck library.
