@@ -11,6 +11,7 @@ import math
 import os
 import re
 import random
+import runpy
 import select
 import shutil
 import signal
@@ -24,8 +25,9 @@ import time
 
 from PIL import Image, ImageDraw, ImageFont
 
-SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
-PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+CLAUDE_DIR = os.path.expanduser("~/.claude")  # where Claude Code keeps its session files and transcripts
+PLUGINS_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                           "claude-session-deck", "plugins")           # see load_plugins()
 STATUS_FILE = os.path.expanduser("~/.claude/claude-session-deck/status.json")   # written by statusline.sh
 WINDOWS_FILE = os.path.expanduser("~/.cache/claude-session-deck/windows.json")  # see learn_window()
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
@@ -172,7 +174,13 @@ MODELS = [
     MiniModel("mini", "Stream Deck Mini", {0x0063, 0x0090}, 3, 2, 80,
               turns=(Image.Transpose.ROTATE_90, Image.Transpose.FLIP_TOP_BOTTOM)),
 ]
-MODEL_OF = {product: model for model in MODELS for product in model.products}
+
+
+def model_of(product):
+    """The model with this USB product ID, None if no model has it."""
+    return next((model for model in MODELS if product in model.products), None)
+
+
 WRITE_TIMEOUT = 2  # seconds a deck may take to accept a report
 
 
@@ -193,7 +201,7 @@ def find_decks():
         except OSError:
             continue
         m = re.search(r"HID_ID=\w+:(\w+):(\w+)", uevent)
-        if m and int(m[1], 16) == ELGATO_VENDOR and int(m[2], 16) in MODEL_OF:
+        if m and int(m[1], 16) == ELGATO_VENDOR and model_of(int(m[2], 16)):
             found["/dev/" + os.path.basename(dev)] = int(m[2], 16)
     for path in glob.glob(os.path.join(RUNTIME_DIR, "deck-*.sock")):
         found[path] = None
@@ -225,9 +233,9 @@ class Deck:
         else:
             self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
         try:
-            if product not in MODEL_OF:
+            if not model_of(product):
                 raise OSError("not a model this program knows")
-            self.model = MODEL_OF[product]
+            self.model = model_of(product)
             self.pressed = {}                      # control -> the states it last reported
             self.shown = [None] * self.model.keys
             self.screen_shown = [None] * self.model.panels
@@ -381,33 +389,65 @@ def is_session(s, start):
         and str(s.get("procStart")) == start
 
 
-def load_sessions():
-    """Live interactive sessions, keyed by the identity of their process."""
-    own_ns = os.readlink("/proc/self/ns/pid")
-    sessions = {}
-    for path in glob.glob(os.path.join(SESSIONS_DIR, "*.json")):
-        try:
-            s = read_json(path)
-        except (OSError, ValueError):
-            continue
-        # A file from another pid namespace belongs to a container: see below.
-        domain = re.search(r"pid:\[\d+\]", s.get("pidDomain", ""))
-        start = proc_start(s.get("pid"))
-        if (domain and domain[0] != own_ns) or not is_session(s, start):
-            continue
-        s.update(hostPid=s["pid"], key=f"{s['pid']}:{start}")
-        sessions[s["key"]] = s
-    sessions.update(container_sessions(own_ns))
-    for found in list(_sandboxed.values()):
-        sessions.update(found)
-    # Sessions sharing a folder are told apart by the name Claude gave them.
-    counts = {}
-    for s in sessions.values():
-        counts[label(s)] = counts.get(label(s), 0) + 1
-    for s in sessions.values():
-        if counts[label(s)] > 1 and s.get("name"):
-            s["label"] = s["name"]
-    return sessions
+# Where sessions are found differs: on this host, in a container, in a virtual
+# machine. Each such place is a Source, and SOURCES lists the ones in use.
+
+class Source:
+    """A place where sessions are found. A subclass describes one.
+
+    A session is a dict as Claude Code writes it to its session file. The
+    daemon uses "sessionId", "status" ("busy", "waiting" or "idle"), "cwd",
+    "name", "nameSource", "waitingFor", and "startedAt" and "statusUpdatedAt"
+    in milliseconds. A source adds "key", which names the session for as long
+    as it lives and is unique among all sources."""
+
+    name = "?"
+
+    def sessions(self):
+        """The live interactive sessions found there now, by their "key".
+
+        Called four times a second, so it must not block; a source that has to
+        wait for something keeps its sessions up to date in a thread."""
+        return {}
+
+    def info(self, session):
+        """What the key shows beyond the session file: {"tokens", "model", "tool"}, each optional.
+
+        Unless overridden, it is read from the transcript on this host, in the
+        folder that the session's "projects" names."""
+        return transcript_info(session)
+
+    def chain(self, session):
+        """Pids of the processes on this host that lead to the session's window, nearest first.
+
+        A window or a tool belongs to the session if it is one of them. Unless
+        overridden, these are the parents of the process "hostPid"."""
+        return ancestors(session.get("hostPid"))
+
+
+class Local(Source):
+    """Sessions on this host, from the session files in a configuration folder of Claude Code."""
+
+    def __init__(self, config=CLAUDE_DIR):
+        self.config = os.path.expanduser(config)
+        self.name = f"session files in {self.config}"
+
+    def sessions(self):
+        own_ns = os.readlink("/proc/self/ns/pid")
+        found = {}
+        for path in glob.glob(os.path.join(self.config, "sessions", "*.json")):
+            try:
+                s = read_json(path)
+            except (OSError, ValueError):
+                continue
+            # A file from another pid namespace belongs to a container: see Containers.
+            domain = re.search(r"pid:\[\d+\]", s.get("pidDomain", ""))
+            start = proc_start(s.get("pid"))
+            if (domain and domain[0] != own_ns) or not is_session(s, start):
+                continue
+            s.update(hostPid=s["pid"], key=f"{s['pid']}:{start}", projects=os.path.join(self.config, "projects"))
+            found[s["key"]] = s
+        return found
 
 
 CLAUDE_PIDS_INTERVAL = 2  # seconds between searches of /proc for Claude processes
@@ -429,27 +469,66 @@ def claude_pids():
     return _claude_pids[1]
 
 
-def container_sessions(own_ns):
-    """Sessions of Claude processes in containers, from the session file each container sees."""
-    found = {}
-    for pid in claude_pids():
-        try:
-            parent, tty, start = proc_stat(pid) or (0, "0", "")
-            if os.readlink(f"/proc/{pid}/ns/pid") == own_ns or tty == "0" \
-                    or read_proc(parent, "comm").strip() == "claude":
+class Containers(Source):
+    """Sessions of Claude processes in containers, from the session file each container sees.
+
+    A container shares the host's kernel, so its processes and files show up in /proc."""
+
+    name = "containers"
+
+    def sessions(self):
+        own_ns = os.readlink("/proc/self/ns/pid")
+        found = {}
+        for pid in claude_pids():
+            try:
+                parent, tty, start = proc_stat(pid) or (0, "0", "")
+                if os.readlink(f"/proc/{pid}/ns/pid") == own_ns or tty == "0" \
+                        or read_proc(parent, "comm").strip() == "claude":
+                    continue
+                env = dict(v.split("=", 1) for v in read_proc(pid, "environ").split("\0") if "=" in v)
+                inner = env.get("CLAUDE_CONFIG_DIR") or os.path.join(env.get("HOME", "/"), ".claude")
+                config = f"/proc/{pid}/root/{inner.lstrip('/')}"  # the container's files, as the host sees them
+                inner_pid = re.search(r"^NSpid:.*?(\d+)$", read_proc(pid, "status"), re.M)[1]
+                s = read_json(os.path.join(config, "sessions", inner_pid + ".json"))
+            except (OSError, ValueError, TypeError):
                 continue
-            env = dict(v.split("=", 1) for v in read_proc(pid, "environ").split("\0") if "=" in v)
-            inner = env.get("CLAUDE_CONFIG_DIR") or os.path.join(env.get("HOME", "/"), ".claude")
-            config = f"/proc/{pid}/root/{inner.lstrip('/')}"  # the container's files, as the host sees them
-            inner_pid = re.search(r"^NSpid:.*?(\d+)$", read_proc(pid, "status"), re.M)[1]
-            s = read_json(os.path.join(config, "sessions", inner_pid + ".json"))
-        except (OSError, ValueError, TypeError):
-            continue
-        if not is_session(s, start):
-            continue
-        s.update(hostPid=pid, key=f"{pid}:{start}", container=True, projects=os.path.join(config, "projects"))
-        found[s["key"]] = s
-    return found
+            if not is_session(s, start):
+                continue
+            s.update(hostPid=pid, key=f"{pid}:{start}", projects=os.path.join(config, "projects"))
+            found[s["key"]] = s
+        return found
+
+    def chain(self, session):
+        # The container's processes do not lead to a window; its client in a terminal does.
+        return ancestors(session["hostPid"]) + ancestors(docker_client(session))
+
+
+_source_errors = {}  # source -> the error it last failed with
+
+
+def load_sessions():
+    """Live interactive sessions of all SOURCES, by their key."""
+    sessions = {}
+    for source in SOURCES:
+        try:
+            found, error = source.sessions(), None
+        except Exception as e:  # one source must not take the others' sessions along
+            found, error = {}, str(e) or type(e).__name__
+        if error != _source_errors.get(source):
+            _source_errors[source] = error
+            if error:
+                log(f"{source.name}: cannot look for sessions: {error}")
+        for key, s in found.items():
+            s["source"] = source
+            sessions[key] = s
+    # Sessions sharing a folder are told apart by the name Claude gave them.
+    counts = {}
+    for s in sessions.values():
+        counts[label(s)] = counts.get(label(s), 0) + 1
+    for s in sessions.values():
+        if counts[label(s)] > 1 and s.get("name"):
+            s["label"] = s["name"]
+    return sessions
 
 
 def label(session):
@@ -471,13 +550,11 @@ MODEL_SWITCH = re.compile(r'"text":\s*"<local-command-stdout>Set model to `([^`]
 
 def transcript_info(session):
     """Context size, model and current tool, read from the transcript tail."""
-    if "meta" in session:  # read inside its sandbox, see watch_sandbox()
-        return session["meta"]
     sid = session["sessionId"]
     cached = _transcripts.get(sid)
     path = cached[0] if cached else None
     if not path:
-        projects = session.get("projects", PROJECTS_DIR)
+        projects = session.get("projects") or os.path.join(CLAUDE_DIR, "projects")
         slug = re.sub(r"[^A-Za-z0-9]", "-", session.get("cwd", ""))
         path = os.path.join(projects, slug, sid + ".jsonl")
         if not os.path.exists(path):
@@ -1102,8 +1179,8 @@ def usage_key(size, now):
 
 # ------------------------------------------------------------- sandboxes ---
 # A container shares the host's kernel, so its processes and files show up in
-# /proc and container_sessions() finds them. A virtual machine or another host
-# shows neither; its sessions are reported by a script that runs inside it.
+# /proc and Containers finds them. A virtual machine or another host shows
+# neither; its sessions are reported by a script that runs inside it.
 
 class Sandbox:
     """A kind of sandbox that can run a command inside. A subclass describes one."""
@@ -1181,7 +1258,7 @@ _sandboxed = {}  # (kind of sandbox, sandbox) -> its sessions, as load_sessions(
 def watch_sandbox(kind, sandbox):
     """Keep the sessions of one sandbox up to date until it has none left."""
     mark = os.urandom(8).hex()  # a transcript cannot contain it, so it cannot pose as the probe
-    metas = {}                  # session id -> transcript_info() of it
+    metas = {}                  # session id -> what parse_transcript() made of its transcript
     sessions, session, transcript = {}, None, None
     proc = subprocess.Popen(kind.command(sandbox) + ["sh", "-c", PROBE, "sh", mark],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -1262,6 +1339,28 @@ def processes(program):
             yield int(entry), args
 
 
+class Sandboxes(Source):
+    """Sessions in the sandboxes of SANDBOXES, as reported by a script that runs inside each."""
+
+    name = "sandboxes"
+    watcher = None
+
+    def sessions(self):
+        if not self.watcher:
+            self.watcher = threading.Thread(target=watch_sandboxes, daemon=True)
+            self.watcher.start()
+        return {key: s for found in list(_sandboxed.values()) for key, s in found.items()}
+
+    def info(self, session):
+        return session.get("meta", {})  # read inside the sandbox, see watch_sandbox()
+
+    def chain(self, session):
+        return ancestors(sandbox_client(session))
+
+
+SOURCES = [Local(), Containers(), Sandboxes()]
+
+
 # What a session in a sandbox reads and writes passes through a client process
 # on the host, such as `sbx run` or `docker run`, and through that one's
 # terminal. So both terminals were last typed into, and last written to, at the
@@ -1329,15 +1428,31 @@ def docker_client(session):
                            and (cwd in args or os.path.realpath(f"/proc/{pid}/cwd") == cwd))
 
 
-# Focusing a window differs per desktop, so each backend offers activate(id) and
-# windows() -> [{"id", "pid", "title", "focus"}], or None if it does not apply here.
+# Focusing a window differs per desktop. Each way to do it is a Backend, and
+# BACKENDS lists them in the order they are tried.
+
+class Backend:
+    """A way to list and raise the windows of a desktop. A subclass describes one."""
+
+    name = "?"
+
+    def windows(self):
+        """The open windows, each {"id", "pid", "title", "focus"}; None if this is not that desktop.
+
+        "pid" is the process that owns the window and "focus" tells whether it
+        has the focus. Raises if this is that desktop but it cannot be used."""
+        return None
+
+    def activate(self, wid):
+        """Raise the window whose "id" is `wid` and give it the focus."""
+
 
 def run_json(*cmd):
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=3, check=True).stdout
     return json.loads(out)
 
 
-class GnomeShell:
+class GnomeShell(Backend):
     """GNOME, through a shell extension that offers List and Activate over D-Bus."""
 
     def __init__(self, name, path, interface):
@@ -1363,7 +1478,7 @@ class GnomeShell:
         self._call("Activate", wid)
 
 
-class Sway:
+class Sway(Backend):
     """Sway, through its IPC."""
     name = "sway"
 
@@ -1383,7 +1498,7 @@ class Sway:
         subprocess.run(["swaymsg", f"[con_id={wid}] focus"], capture_output=True, timeout=3)
 
 
-class Hyprland:
+class Hyprland(Backend):
     """Hyprland, through hyprctl."""
     name = "hyprland"
 
@@ -1399,7 +1514,7 @@ class Hyprland:
                        capture_output=True, timeout=3)
 
 
-class KWin:
+class KWin(Backend):
     """KDE Plasma on Wayland, through the kdotool program."""
     name = "kdotool"
 
@@ -1428,7 +1543,7 @@ class KWin:
         self._run("windowactivate", wid)
 
 
-class X11:
+class X11(Backend):
     """Any X11 window manager, through EWMH; under Wayland it reaches XWayland programs only."""
     name = "x11"
 
@@ -1552,16 +1667,6 @@ def window_score(session, chain, window):
     return score
 
 
-def session_chain(session):
-    """Pids of the session's parent processes, up to its terminal or IDE."""
-    if session.get("sandbox"):
-        return ancestors(sandbox_client(session))
-    chain = ancestors(session["hostPid"])
-    if session.get("container"):
-        chain += ancestors(docker_client(session))
-    return chain
-
-
 def list_windows():
     """(backend, windows, notes) from the first backend usable on this desktop."""
     notes = []
@@ -1595,7 +1700,7 @@ def learned_windows():
 def learn_window(session, live_keys):
     """Remember the focused window as the session's, if it belongs to its terminal or IDE."""
     backend, windows, _ = list_windows()
-    chain = session_chain(session)
+    chain = session["source"].chain(session)
     focused = [w for w in windows if w.get("focus") and w.get("pid") in chain]
     if not focused:
         return
@@ -1695,7 +1800,7 @@ def session_tool(chain):
 
 
 def focus(session):
-    chain = session_chain(session)
+    chain = session["source"].chain(session)
     tool, pid = session_tool(chain)
     title = None
     if tool:
@@ -1717,7 +1822,7 @@ def focus(session):
 
 def key_info(session, state, since, offset):
     """What render() draws a session's key from; `offset` shifts when its mascot appears."""
-    meta = transcript_info(session)
+    meta = session["source"].info(session)
     if state == "busy":
         activity = meta.get("tool") or "thinking"
     elif state == "waiting":
@@ -1986,8 +2091,21 @@ def attach(decks, errors):
                 log(f"cannot use {path}: {error}")
 
 
+def load_plugins():
+    """Run the Python files in PLUGINS_DIR.
+
+    A plugin imports this module as `claude_session_deck` and adds to SOURCES,
+    TOOLS, BACKENDS, SANDBOXES or MODELS; see "Extending" in the README."""
+    sys.modules.setdefault("claude_session_deck", sys.modules[__name__])  # not a second copy of this module
+    for path in sorted(glob.glob(os.path.join(PLUGINS_DIR, "*.py"))):
+        try:
+            runpy.run_path(path)
+            log(f"loaded plugin {path}")
+        except Exception as e:
+            log(f"cannot load plugin {path}: {type(e).__name__}: {e}")
+
+
 def main():
-    threading.Thread(target=watch_sandboxes, daemon=True).start()
     decks, errors = {}, {}  # both by path
     board = Sessions()
     login = Login()
@@ -2094,6 +2212,7 @@ def calibrate():
 
 
 if __name__ == "__main__":
+    load_plugins()
     if "--calibrate" in sys.argv[1:]:
         try:
             calibrate()
