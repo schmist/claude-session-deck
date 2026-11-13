@@ -12,9 +12,12 @@ import os
 import re
 import random
 import select
+import shutil
 import socket
+import stat
 import subprocess
 import sys
+import threading
 import time
 
 from PIL import Image, ImageDraw, ImageFont
@@ -144,6 +147,8 @@ def load_sessions():
         s["hostPid"] = s["pid"]
         sessions[s["pid"], start] = s
     sessions.update(container_sessions(own_ns))
+    for found in list(_sandboxed.values()):
+        sessions.update(found)
     # Sessions sharing a folder are told apart by the name Claude gave them.
     counts = {}
     for s in sessions.values():
@@ -173,6 +178,10 @@ def container_sessions(own_ns):
             cwd = os.readlink(f"/proc/{entry}/cwd")
         except (OSError, IndexError):
             continue
+        own = container_own_session(entry, start)
+        if own:
+            found[int(entry), start] = own
+            continue
         started = (BOOT_TIME + int(start) / os.sysconf("SC_CLK_TCK")) * 1000
         s = {"sessionId": container_session_id(entry), "pid": None, "hostPid": int(entry),
              "cwd": cwd, "status": "unknown", "startedAt": started}
@@ -184,6 +193,27 @@ def container_sessions(own_ns):
                      nameSource="user" if meta.get("custom-title") else "derived")
         found[int(entry), start] = s
     return found
+
+
+def container_own_session(pid, start):
+    """Session of a containerised process, from the container's own Claude folder.
+
+    None if the container uses the host's folder, or the file cannot be read."""
+    try:
+        env = dict(v.split("=", 1) for v in open(f"/proc/{pid}/environ").read().split("\0") if "=" in v)
+        inner = env.get("CLAUDE_CONFIG_DIR") or os.path.join(env.get("HOME", "/"), ".claude")
+        config = f"/proc/{pid}/root/{inner.lstrip('/')}"  # the container's files, as the host sees them
+        if os.path.samefile(config, os.path.dirname(SESSIONS_DIR)):
+            return None
+        inner_pid = re.search(r"^NSpid:.*?(\d+)$", open(f"/proc/{pid}/status").read(), re.M)[1]
+        s = json.load(open(os.path.join(config, "sessions", inner_pid + ".json")))
+    except (OSError, ValueError, TypeError):
+        return None
+    if s.get("kind", "interactive") != "interactive" or not s.get("sessionId") \
+            or str(s.get("procStart")) != start:
+        return None
+    s.update(hostPid=int(pid), projects=os.path.join(config, "projects"))
+    return s
 
 
 def container_session_id(pid):
@@ -212,19 +242,23 @@ def label(session):
 # -------------------------------------------------------------- metadata ---
 
 _transcripts = {}  # session id -> (path, mtime, size, info)
+TRANSCRIPT_TAIL = 400_000  # bytes read from the end
 TITLE_FIELDS = {"custom-title": "customTitle", "ai-title": "aiTitle"}  # entry type -> field
 
 
 def transcript_info(session):
     """Context size, current tool, titles and state, read from the transcript tail."""
+    if "meta" in session:  # read inside its sandbox, see watch_sandbox()
+        return session["meta"]
     sid = session["sessionId"]
     cached = _transcripts.get(sid)
     path = cached[0] if cached else None
     if not path:
+        projects = session.get("projects", PROJECTS_DIR)
         slug = re.sub(r"[^A-Za-z0-9]", "-", session.get("cwd", ""))
-        path = os.path.join(PROJECTS_DIR, slug, sid + ".jsonl")
+        path = os.path.join(projects, slug, sid + ".jsonl")
         if not os.path.exists(path):
-            found = glob.glob(os.path.join(PROJECTS_DIR, "*", sid + ".jsonl"))
+            found = glob.glob(os.path.join(projects, "*", sid + ".jsonl"))
             if not found:
                 return {}
             path = found[0]
@@ -233,11 +267,18 @@ def transcript_info(session):
         if cached and cached[1:3] == (st.st_mtime, st.st_size):
             return cached[3]
         with open(path, "rb") as f:
-            f.seek(max(0, st.st_size - 400_000))
+            f.seek(max(0, st.st_size - TRANSCRIPT_TAIL))
             lines = f.read().decode("utf-8", "replace").splitlines()
     except OSError:
         return {}
-    info = dict(cached[3]) if cached else {}  # keep values the tail no longer has
+    info = parse_transcript(lines, cached[3] if cached else {})
+    _transcripts[sid] = (path, st.st_mtime, st.st_size, info)
+    return info
+
+
+def parse_transcript(lines, previous):
+    """Info from the last `lines` of a transcript; `previous` is what an earlier read gave."""
+    info = dict(previous)  # keep values the tail no longer has
     for key in ("tool", "status", "since"):
         info.pop(key, None)
     seen_turn = seen_usage = False
@@ -282,7 +323,6 @@ def transcript_info(session):
             seen_usage = True
             info["tokens"] = sum(usage.get(k) or 0 for k in (
                 "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-    _transcripts[sid] = (path, st.st_mtime, st.st_size, info)
     return info
 
 
@@ -609,6 +649,217 @@ def render_usage():
     return img
 
 
+# ------------------------------------------------------------- sandboxes ---
+# A container shares the host's kernel, so its processes and files show up in
+# /proc and container_sessions() finds them. A virtual machine or another host
+# shows neither; its sessions are reported by a script that runs inside it.
+
+class Sandbox:
+    """A kind of sandbox that can run a command inside. A subclass describes one."""
+
+    name = "?"
+    program = "?"  # what the user runs in a terminal to work in such a sandbox
+
+    def running(self):
+        """Names of the sandboxes that are running now."""
+        return []
+
+    def command(self, sandbox):
+        """Start of a command line that runs its remaining arguments inside `sandbox`.
+
+        The command's input and output must be passed through."""
+        raise NotImplementedError
+
+
+class Sbx(Sandbox):
+    """Docker Sandboxes, each a virtual machine."""
+
+    name = program = "sbx"
+
+    def running(self):
+        # Without its daemon nothing runs, and asking would start it.
+        if not shutil.which("sbx") or not any(args[1:2] == ["daemon"] for _, args in processes("sbx")):
+            return []
+        return [s["name"] for s in run_json("sbx", "ls", "--format", "json") if s.get("status") == "running"]
+
+    def command(self, sandbox):
+        return ["sbx", "exec", "-i", sandbox]
+
+
+SANDBOXES = [Sbx()]
+SANDBOX_INTERVAL = 5  # seconds between looks for sandboxes that started
+
+# Runs inside a sandbox for as long as it has sessions. It reports each live
+# session's file, process and terminal times (see terminal_client()), and its
+# transcript's tail when that grew, then
+# waits for a line on its input; so it ends when the daemon does.
+# Every line of its own starts with the word passed as $1; other lines are transcript.
+PROBE = r"""
+n=$1
+dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+sizes=
+while :; do
+    live= seen=
+    for f in "$dir"/sessions/*.json; do
+        pid=${f##*/} pid=${pid%.json} stat= json=
+        read -r stat <"/proc/$pid/stat" || [ -n "$stat" ] || continue
+        read -r json <"$f" || [ -n "$json" ] || continue
+        sid=${json#*\"sessionId\":} sid=${sid#*\"} sid=${sid%%\"*}
+        case $sid in ""|*[!0-9a-f-]*) continue ;; esac
+        live=1
+        printf '%s\n' "$n session $json" "$n stat $stat" "$n tty $(stat -L -c '%X %Y' "/proc/$pid/fd/0")"
+        for t in "$dir"/projects/*/"$sid".jsonl; do
+            [ -f "$t" ] || continue
+            size=$(($(wc -c <"$t")))
+            seen="$seen $sid:$size "
+            case $sizes in *" $sid:$size "*) continue ;; esac
+            printf '%s\n' "$n transcript $sid"
+            tail -c """ + str(TRANSCRIPT_TAIL) + r""" "$t"
+            printf '\n%s\n' "$n end"
+        done
+    done 2>/dev/null
+    sizes=$seen
+    printf '%s\n' "$n done"
+    [ -n "$live" ] && read -r next || exit 0
+done
+"""
+
+_sandboxed = {}  # (kind of sandbox, sandbox) -> its sessions, as load_sessions() returns them
+
+
+def watch_sandbox(kind, sandbox):
+    """Keep the sessions of one sandbox up to date until it has none left."""
+    mark = os.urandom(8).hex()  # a transcript cannot contain it, so it cannot pose as the probe
+    metas = {}                  # session id -> transcript_info() of it
+    sessions, session, transcript = {}, None, None
+    proc = subprocess.Popen(kind.command(sandbox) + ["sh", "-c", PROBE, "sh", mark],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if not line.startswith(mark + " "):
+                if transcript:
+                    transcript[1].append(line)
+                continue
+            word, _, rest = line[len(mark) + 1:].partition(" ")
+            if word == "session":
+                try:
+                    session = json.loads(rest)
+                except ValueError:
+                    session = None
+            elif word == "stat" and isinstance(session, dict):
+                start = rest.rsplit(")", 1)[-1].split()[19:20]
+                if session.get("kind", "interactive") == "interactive" and session.get("sessionId") \
+                        and [str(session.get("procStart"))] == start:
+                    session.update(hostPid=None, sandbox=(kind, sandbox),
+                                   key=f"{kind.name}:{sandbox}:{session.get('pid')}:{start[0]}")
+                    sessions[session["key"]] = session
+            elif word == "tty" and isinstance(session, dict):
+                try:
+                    session["tty"] = tuple(float(t) for t in rest.split())
+                except ValueError:
+                    pass
+            elif word == "transcript":
+                transcript = (rest, [])
+            elif word == "end" and transcript:
+                metas[transcript[0]] = parse_transcript(transcript[1], metas.get(transcript[0], {}))
+                transcript = None
+            elif word == "done":
+                for s in sessions.values():
+                    s["meta"] = metas.get(s["sessionId"], {})
+                _sandboxed[kind, sandbox] = sessions
+                sessions = {}
+                time.sleep(1)
+                os.write(proc.stdin.fileno(), b"\n")  # ask for the next report
+    except OSError:
+        pass
+    finally:
+        _sandboxed.pop((kind, sandbox), None)
+        proc.kill()
+        proc.wait()
+
+
+def watch_sandboxes():
+    """Watch every running sandbox; meant to run in a thread of its own."""
+    watching, errors = {}, {}
+    while True:
+        for kind in SANDBOXES:
+            try:
+                names, error = kind.running(), None
+            except Exception as e:
+                names, error = [], str(e)
+            if error != errors.get(kind):
+                errors[kind] = error
+                if error:
+                    log(f"{kind.name}: cannot list sandboxes: {error}")
+            for name in names:
+                if (kind, name) not in watching or not watching[kind, name].is_alive():
+                    watching[kind, name] = threading.Thread(target=watch_sandbox, args=(kind, name), daemon=True)
+                    watching[kind, name].start()
+        time.sleep(SANDBOX_INTERVAL)
+
+
+def processes(program):
+    """(pid, arguments) of each process on this host that runs `program`."""
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            args = open(f"/proc/{entry}/cmdline").read().split("\0")
+        except OSError:
+            continue
+        if os.path.basename(args[0]) == program:
+            yield int(entry), args
+
+
+# What a session in a sandbox reads and writes passes through a client process
+# on the host, such as `sbx run` or `docker run`, and through that one's
+# terminal. So both terminals were last typed into, and last written to, at the
+# same moments, which tells the client of one session from that of another.
+TERMINAL_SLACK = 16  # seconds the times may differ: the kernel records them in steps of 8
+
+
+def terminal_times(path):
+    """(last read, last written) of the terminal at `path`, None if it is not one."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_atime, st.st_mtime) if stat.S_ISCHR(st.st_mode) else None
+
+
+def terminal_client(program, times, likely=lambda pid, args, start: True):
+    """Pid of the `program` process in a terminal through which the user works in a session.
+
+    `times` are the terminal_times() of the session's own terminal. Without a
+    process whose terminal has these, it is the latest one that is `likely`."""
+    exact, exact_off, guess, guess_start = None, TERMINAL_SLACK, None, -1
+    for pid, args in processes(program):
+        try:
+            fields = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+            parent, tty, start = int(fields[1]), fields[4], int(fields[19])
+        except (OSError, IndexError, ValueError):
+            continue
+        if tty == "0" or parent == os.getpid():  # not in a terminal, or a probe of ours
+            continue
+        own = terminal_times(f"/proc/{pid}/fd/0")
+        if times and own and len(times) == 2:
+            off = abs(own[0] - times[0]) + abs(own[1] - times[1])
+            if off < exact_off:
+                exact, exact_off = pid, off
+        if start > guess_start and likely(pid, args, start):
+            guess, guess_start = pid, start
+    return exact or guess
+
+
+def sandbox_client(session):
+    """Pid of the process in a terminal through which the user works in the sandboxed session."""
+    kind, sandbox = session["sandbox"]
+    cwd = session.get("cwd", "")
+    return terminal_client(kind.program, session.get("tty"), lambda pid, args, start:
+                           sandbox in args or cwd in args or os.path.realpath(f"/proc/{pid}/cwd") == cwd)
+
+
 # --------------------------------------------------------- window focus ---
 
 def ancestors(pid):
@@ -626,23 +877,11 @@ def docker_client(session):
     """Pid of the `docker run` process that hosts a containerised session."""
     cwd = session.get("cwd", "")
     born = int(proc_start(session["hostPid"]) or 0)
-    best, best_start = None, -1
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            args = open(f"/proc/{entry}/cmdline").read().split("\0")
-            start = int(proc_start(entry) or 0)
-        except OSError:
-            continue
-        if os.path.basename(args[0]) != "docker" or "run" not in args:
-            continue
-        if cwd in args or os.path.realpath(f"/proc/{entry}/cwd") == cwd:
-            # The client starts just before its container, so the latest one
-            # started before the session is its own.
-            if best_start < start <= born:
-                best, best_start = int(entry), start
-    return best
+    # The client starts just before its container, so the latest one started
+    # before the session is likely its own.
+    return terminal_client("docker", terminal_times(f"/proc/{session['hostPid']}/fd/0"), lambda pid, args, start:
+                           "run" in args and start <= born
+                           and (cwd in args or os.path.realpath(f"/proc/{pid}/cwd") == cwd))
 
 
 # Focusing a window differs per desktop, so each backend offers activate(id) and
@@ -870,6 +1109,8 @@ def window_score(session, chain, window):
 
 def session_chain(session):
     """Pids of the session's parent processes, up to its terminal or IDE."""
+    if session.get("sandbox"):
+        return ancestors(sandbox_client(session))
     chain = ancestors(session["hostPid"])
     if session["hostPid"] != session.get("pid"):  # containerised
         chain += ancestors(docker_client(session))
@@ -897,7 +1138,7 @@ _learned = None  # "hostPid:procStart" -> {"backend": name, "id": window id}
 
 
 def process_key(session):
-    return f"{session['hostPid']}:{proc_start(session['hostPid'])}"
+    return session.get("key") or f"{session['hostPid']}:{proc_start(session['hostPid'])}"
 
 
 def learned_windows():
@@ -1084,7 +1325,7 @@ def run(deck):
             for stale in set(_transcripts) - live_ids:
                 del _transcripts[stale]
             # Oldest session first, so later ones move up when a session ends.
-            order = sorted(sessions, key=lambda sid: int(proc_start(sessions[sid]["hostPid"]) or 0))
+            order = sorted(sessions, key=lambda sid: sessions[sid].get("startedAt") or 0)
             slots = (order + [None] * KEYS)[:KEYS]
             slots[USAGE_KEY] = None  # reserved for the account usage
             for key, sid in enumerate(slots):
@@ -1123,6 +1364,7 @@ def run(deck):
 
 
 def main():
+    threading.Thread(target=watch_sandboxes, daemon=True).start()
     while True:
         path = Deck.find()
         if not path:

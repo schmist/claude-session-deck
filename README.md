@@ -117,18 +117,49 @@ saves the data for the daemon and then runs the status line you had before, if
 any. The uninstaller restores the previous setting, and a copy of your earlier
 settings is kept in `~/.claude/claude-session-deck/settings.json.before-claude-session-deck`.
 
-**Sessions in Docker** are shown if the container mounts the host's
-`~/.claude` and runs as your user. They all have process ID 1 and so share one
-session file, which cannot tell them apart. The daemon therefore finds their
-processes itself and derives name and state from each session's transcript,
-with two consequences:
+**Sessions in sandboxes.** How a session is found depends on what the host
+can see of its sandbox:
+
+| Sandbox | What the host sees | How the session is found |
+|---|---|---|
+| Container that keeps its own `~/.claude` (Docker, Podman, …) | The process, and its files under `/proc/<pid>/root` | The daemon reads the session file and transcript inside the container |
+| Container that mounts the host's `~/.claude` | The same, but all such sessions have process ID 1 and so share one session file | The daemon finds the processes itself and derives name and state from each transcript |
+| Virtual machine ([Docker Sandboxes](https://docs.docker.com/ai/sandboxes/), `sbx`) | Nothing | A script run inside the sandbox reports its sessions |
+
+A container needs no setup, whatever started it, as long as its `claude`
+process runs as your user. For the shared `~/.claude`, deriving the state has
+two consequences:
 
 - A permission prompt shows as working, not as needing you; questions and
   plan approvals are recognised.
 - A session whose transcript cannot be found reads `no status yet`.
 
+In a virtual machine, the daemon starts a small shell script through the
+sandbox's own command (`sbx exec`) in each running sandbox. Once a second it
+reports the session files of live sessions and the end of a transcript that
+grew; nothing is stored on the host. The script ends when the sandbox has no
+session left or the daemon stops, and needs only `sh`, `wc` and `tail` inside.
+A sandbox that is stopped is not started.
+
+**The terminal of a sandboxed session.** Such a session has no parent process
+on the host that leads to its window. What it reads and writes passes through
+a client process in your terminal instead, such as `sbx run` or `docker run`.
+The session's terminal inside the sandbox and the client's terminal on the
+host were therefore last typed into, and last written to, at the same moments;
+the daemon compares these times to tell which client, and so which window and
+tab, belongs to which session. This also holds for several sessions in one
+sandbox. If no client matches, it takes the latest one started for that
+sandbox or project folder.
+
+**Adding a kind of sandbox.** Anything that can run a command inside, such as
+`ssh` to another machine, is a subclass of `Sandbox` in
+`claude_session_deck.py`, listed in `SANDBOXES`: `running()` returns the names
+of the running sandboxes and `command(name)` the start of a command line that
+runs its remaining arguments inside one, as `["sbx", "exec", "-i", name]`
+does.
+
 **Sessions in the same folder** are labelled with the name Claude gave them;
-in Docker, with the session's title.
+in a container sharing the host's `~/.claude`, with the session's title.
 
 **The deck.** The daemon writes JPEG images straight to the device and reads
 key presses from it, without a Stream Deck library.
@@ -252,4 +283,4 @@ journalctl --user -u claude-session-deck -f     # log
 | Log shows `no window found for …` | The line lists each mechanism tried; none applies to your desktop, or no window matches the session |
 | The wrong terminal tab stays selected in a JetBrains IDE | The plugin is not loaded: run `./install.sh`, then restart the IDE. If the log shows `JetBrains IDE: cannot focus …`, see the IDE's own log (Help → Show Log) |
 | Usage key reads `no data yet` | The status line command is not set up (run `./install.sh` again), no session has been active since, or the account has no usage limits |
-| A session is missing | It is not interactive, or its container does not share `~/.claude` |
+| A session is missing | It is not interactive, or it runs in a sandbox the daemon cannot look into: a container whose process is not yours, or a [kind of sandbox](#how-it-works) it does not know |
