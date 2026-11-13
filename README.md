@@ -7,7 +7,8 @@ terminal tab.
 
 ![Rendering of a Stream Deck with eight example sessions and the usage key](docs/preview.png)
 
-*Rendering with example sessions; the keys are drawn by the daemon's own code.*
+*Rendering with example sessions, made by `docs/preview.py`. The keys are drawn
+by the daemon's own code and shown pixel for pixel, at 72 × 72 px each.*
 
 > **Work in progress.** This currently only works with the one deck it was
 > developed on, an Elgato Stream Deck MK.2 (15 keys, USB ID `0fd9:0080`).
