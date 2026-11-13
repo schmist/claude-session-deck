@@ -10,9 +10,9 @@ terminal tab.
 *Rendering with example sessions, made by `docs/preview.py`. The keys are drawn
 by the daemon's own code and shown pixel for pixel, at 72 × 72 px each.*
 
-> **Work in progress.** This currently only works with the one deck it was
-> developed on, an Elgato Stream Deck MK.2 (15 keys, USB ID `0fd9:0080`).
-> Other models are not supported.
+> **Work in progress.** Only the deck this was developed on, an Elgato Stream
+> Deck MK.2 (15 keys, USB ID `0fd9:0080`), was tried for real. The
+> [other models](#decks) were only tried on the [emulator](#emulated-decks).
 
 Not affiliated with Anthropic or Elgato.
 
@@ -35,7 +35,10 @@ Not affiliated with Anthropic or Elgato.
 | Idle | Grey | None |
 
 Keys fill left to right, top to bottom, oldest session first. The bottom-right
-key is reserved, so up to 14 sessions are shown.
+key is reserved, so a deck shows one session fewer than it has keys: 14 on an
+MK.2. Every deck shows the same sessions, as many as it has room for. A deck
+with a [screen next to its keys](#screens-dials-and-touch-keys) shows the
+usage there and has all its keys for sessions.
 
 **The usage key** (bottom right) shows the account's 5-hour and weekly usage
 limits: percentage used, a bar and the time until reset. It turns amber above
@@ -46,7 +49,7 @@ while a session is active; for accounts without such limits the key reads
 ## Requirements
 
 - Linux with systemd user services
-- A Stream Deck MK.2; the original V2 uses the same protocol but is untested
+- One or more Stream Decks of a [model it knows](#decks), or the [emulator](#emulated-decks)
 - Python 3.8+ with Pillow
 - To jump to windows: a supported desktop, see [Jumping to a window](#jumping-to-a-window)
 - Optional: the Ubuntu font; the fallback font is wider, so more text gets shortened
@@ -156,8 +159,85 @@ does.
 
 **Sessions in the same folder** are labelled with the name Claude gave them.
 
-**The deck.** The daemon writes JPEG images straight to the device and reads
-key presses from it, without a Stream Deck library.
+**The deck.** The daemon writes images straight to the device and reads key
+presses from it, without a Stream Deck library. See [Decks](#decks).
+
+## Decks
+
+The daemon uses every deck it finds, and looks for new ones every 2 seconds:
+plug one in or unplug it at any time. Each deck is drawn for its own number of
+keys and their size; a press on any of them jumps to the session.
+
+| Model | Keys | Key size | Also has | Tried on |
+|---|---|---|---|---|
+| Stream Deck MK.2, Original V2 | 5 × 3 | 72 px | | A real MK.2 |
+| Stream Deck XL | 8 × 4 | 96 px | | The emulator |
+| Stream Deck + | 4 × 2 | 120 px | Touch screen of 800 × 100 px, 4 dials | The emulator |
+| Stream Deck Neo | 4 × 2 | 96 px | Screen of 248 × 58 px, 2 touch keys | The emulator |
+| Stream Deck Mini | 3 × 2 | 80 px | | The emulator |
+
+The models that were only tried on the emulator are written from what other
+projects document of their protocol, so a real one may not work yet. The
+Original of 2017 (USB ID `0fd9:0060`) is not supported.
+
+### Screens, dials and touch keys
+
+The screen of the + and of the Neo is drawn like a key: the daemon sends it an
+image, on the + in four parts so that only what changed is sent. It shows how
+many sessions need you, are done and are working, and the account usage.
+
+| Control | What it does |
+|---|---|
+| + screen | Four panels: needs you, done, working, usage |
+| + dial, pushed | Jumps to the next session in the state of the panel above it; pushed again, to the one after |
+| + screen, touched | The same as pushing the dial under that panel |
+| + dial, turned | Brightness of that deck, 5% a step, until the daemon restarts |
+| Neo screen | The three counts and the usage |
+| Neo touch key | Jumps to the next session that needs you, or else to one that is done |
+
+Not used: long touches and swipes on the + screen, and the lights of the Neo's
+touch keys.
+
+The drawing is laid out for a key of 72 px and scaled to other sizes, with
+text drawn at the key's own size so that it stays sharp.
+
+**Adding a model.** A model is an entry in `MODELS` in
+`claude_session_deck.py`: its USB product IDs, columns, rows, key size and how
+an image is turned before it is sent. One with another protocol, a screen or
+other controls is a subclass of `Model`, as `MiniModel` and `PlusModel` are;
+its counterpart for the emulator is a subclass of `Firmware` in `emulator.py`.
+What a press, turn or touch does is decided in `act()`.
+
+### Emulated decks
+
+`emulator.py` stands in for decks that are not plugged in, to work on a model
+without having it:
+
+```sh
+./emulator.py              # one deck of each model
+./emulator.py xl mini mk2  # these three; a model may be given more than once
+```
+
+It prints the address of a page, `http://127.0.0.1:8317/` unless `--port` says
+otherwise, that shows each deck to scale with what the daemon draws on it.
+Click a key, dial or touch key to press it, scroll over a dial to turn it, and
+click the screen of the + to touch it. The running service picks emulated
+decks up like real ones, next to those that are plugged in, and drops them
+when the emulator ends.
+
+An emulated deck is a socket in `$XDG_RUNTIME_DIR/claude-session-deck/`, which
+only your user can reach. The daemon sends it the same reports as the real
+model, and the emulator decodes them as that model would: it checks the report
+headers, the order of an image's parts, the image format and its size, and
+turns the image back the way the model's screen is mounted. What a deck does
+not understand shows as a protocol error on the page and in the emulator's
+output. The emulator knows the protocols from the same sources as the daemon,
+so it catches the daemon's mistakes, not wrong assumptions about a model.
+
+Like a real deck, an emulated one serves a single program: while the service
+uses it, a second daemon started from the source folder gets none. To try
+changed code, stop the service first (`systemctl --user stop
+claude-session-deck`) or install the change with `./install.sh`.
 
 ## Jumping to a window
 
@@ -251,7 +331,7 @@ The settings are constants at the top of `claude_session_deck.py`; change them a
 | `BRIGHTNESS` | `60` | Key brightness in percent |
 | `FPS` | `12` | Frames per second while something is animating |
 | `CONTEXT_WINDOW` | `1_000_000` | Token count at which the context bar is full |
-| `SAFE_BOTTOM` | `9` | Bottom pixels left empty because the keycap rim hides them |
+| `SAFE_BOTTOM` | `9` | Bottom pixels left empty because the keycap rim hides them, of a key 72 px high; scaled for other models |
 | `MASCOT_EVERY` | `25` | Seconds between appearances of the large creature |
 | `MASCOT_SECONDS` | `6` | How long it stays |
 | `MODEL_EVERY`, `MODEL_SECONDS` | `9`, `3` | The model replaces the name for 3 s every 9 s |
@@ -259,7 +339,7 @@ The settings are constants at the top of `claude_session_deck.py`; change them a
 | `FONT` | Ubuntu variable font | Font file used for all text |
 
 To see how much your keycaps hide, stop the service and run
-`python3 claude_session_deck.py --calibrate`. Every key shows nested frames, each
+`python3 claude_session_deck.py --calibrate`. Every key of every deck shows nested frames, each
 3 pixels wide: white outermost, then red, yellow, green, blue. The outermost
 colour visible on a side tells how much is hidden there.
 
@@ -273,7 +353,7 @@ journalctl --user -u claude-session-deck -f     # log
 | Symptom | Cause and fix |
 |---|---|
 | Deck stays dark, log shows `Permission denied` | No access to the device: see Device access under [Install](#install) |
-| Deck stays dark, nothing in the log | No supported deck found: check `lsusb` for vendor `0fd9`; only 15-key models are supported |
+| Deck stays dark, nothing in the log | No supported deck found: check `lsusb` for vendor `0fd9`; it must be one of the [models](#decks) the daemon knows |
 | Keys flicker or show other content | Another Stream Deck program is running; stop it |
 | Pressing a key does nothing, log shows both extensions as `not loaded` | Install Window Calls, or log out and in and run `gnome-extensions enable claude-session-deck-windows@local` |
 | Log shows `no window found for …` | The line lists each mechanism tried; none applies to your desktop, or no window matches the session |

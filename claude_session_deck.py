@@ -14,6 +14,7 @@ import select
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -26,15 +27,13 @@ PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 STATUS_FILE = os.path.expanduser("~/.claude/claude-session-deck/status.json")   # written by statusline.sh
 WINDOWS_FILE = os.path.expanduser("~/.cache/claude-session-deck/windows.json")  # see learn_window()
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
-                           "claude-session-deck")                                # sockets of TOOLS
+                           "claude-session-deck")                # sockets of TOOLS and of emulated decks
 ELGATO_VENDOR = 0x0FD9
-PRODUCTS = {0x006D, 0x0080, 0x00A5}  # "Original V2" protocol: 15 keys, 72 px JPEG, rotated 180°
-KEYS, SIZE = 15, 72
-USAGE_KEY = KEYS - 1        # bottom right
+UNIT = 72                   # key size in pixels that the drawing is laid out for; other sizes are scaled from it
 BRIGHTNESS = 60             # percent
 FPS = 12                    # while something is animating
 CONTEXT_WINDOW = 1_000_000  # tokens at which the context bar is full
-SAFE_BOTTOM = 9             # bottom pixels hidden by the keycap rim
+SAFE_BOTTOM = 9             # bottom pixels hidden by the keycap rim, of a key UNIT pixels high
 MASCOT_EVERY = 25           # seconds between mascot appearances while working
 MASCOT_SECONDS = 6          # how long it stays
 MODEL_EVERY, MODEL_SECONDS = 9, 3  # the model replaces the session's name for 3 s every 9 s
@@ -48,76 +47,274 @@ def log(*args):
 
 # ---------------------------------------------------------------- device ---
 
-class Deck:
-    def __init__(self, path):
-        self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
-        self.pressed = [False] * KEYS
-        self.shown = [None] * KEYS
+class Model:
+    """A kind of Stream Deck: its keys, and how it takes images and reports presses.
+
+    This class speaks the protocol of the Original V2 and the models after it."""
+
+    image_format = "JPEG"
+    keys_at = 4        # where a report of the keys holds their states
+    screen = None      # (width, height) of the screen next to the keys, if there is one
+    screen_turns = ()  # how an image for it is turned before it is sent
+    panels = 1         # parts of equal width that the screen is drawn and sent in
+
+    def __init__(self, id, name, products, cols, rows, size,
+                 turns=(Image.Transpose.ROTATE_180,), key_report=b"\x01"):
+        self.id, self.name, self.products = id, name, products  # id: short name, for emulator.py
+        self.cols, self.rows, self.keys = cols, rows, cols * rows
+        self.size = size              # pixels along a key's side
+        self.turns = turns            # how an image is turned before it is sent
+        self.key_report = key_report  # what a report of the keys starts with; others are ignored
+
+    def brightness(self, percent):
+        """The feature report that sets the brightness."""
+        return bytes([0x03, 0x08, percent]).ljust(32, b"\0")
+
+    def image_reports(self, key, data):
+        """The output reports that draw the encoded image `data` on `key`."""
+        page = 0
+        while data:
+            chunk, data = data[:1016], data[1016:]
+            header = bytes([0x02, 0x07, key, 0 if data else 1,
+                            len(chunk) & 0xFF, len(chunk) >> 8, page & 0xFF, page >> 8])
+            yield (header + chunk).ljust(1024, b"\0")
+            page += 1
+
+    def read(self, report):
+        """What an input report tells, by control: {"key": the state of each key}.
+
+        Models with more than keys also tell "push" (the state of each dial),
+        "turn" (the steps each dial was turned by), "touch" (where the screen
+        was touched) and "pad" (the state of each touch key)."""
+        states = [bool(b) for b in report[self.keys_at:self.keys_at + self.keys]]
+        if len(states) < self.keys or not report.startswith(self.key_report):
+            return {}
+        return {"key": states}
+
+
+class PlusModel(Model):
+    """The +, with four dials under a touch screen as wide as the deck."""
+
+    screen, panels = (800, 100), 4
+
+    def read(self, report):
+        if report[:2] == b"\x01\x03" and len(report) >= 9:  # the dials
+            if report[4] == 1:
+                return {"turn": [b - 256 if b > 127 else b for b in report[5:9]]}
+            return {"push": [bool(b) for b in report[5:9]]}
+        if report[:2] == b"\x01\x02" and len(report) >= 10:  # a touch
+            return {"touch": (report[6] | report[7] << 8, report[8] | report[9] << 8)}
+        return super().read(report)
+
+    def screen_reports(self, data, box):
+        """The output reports that draw the encoded image `data` in the part `box` of the screen."""
+        page = 0
+        while data:
+            chunk, data = data[:1008], data[1008:]
+            header = struct.pack("<BBHHHHBHHB", 0x02, 0x0C, box[0], box[1], box[2] - box[0], box[3] - box[1],
+                                 0 if data else 1, page, len(chunk), 0)
+            yield (header + chunk).ljust(1024, b"\0")
+            page += 1
+
+
+class NeoModel(Model):
+    """The Neo, with a small screen between two touch keys."""
+
+    screen = (248, 58)
+    screen_turns = (Image.Transpose.ROTATE_180,)
+
+    def read(self, report):
+        found = super().read(report)
+        if found:
+            found["pad"] = [bool(b) for b in report[self.keys_at + self.keys:self.keys_at + self.keys + 2]]
+        return found
+
+    def screen_reports(self, data, box):
+        page = 0
+        while data:
+            chunk, data = data[:1016], data[1016:]
+            header = bytes([0x02, 0x0B, 0, 0 if data else 1,
+                            len(chunk) & 0xFF, len(chunk) >> 8, page & 0xFF, page >> 8])
+            yield (header + chunk).ljust(1024, b"\0")
+            page += 1
+
+
+class MiniModel(Model):
+    """The Mini, which takes uncompressed images and has reports of its own."""
+
+    image_format = "BMP"
+    keys_at = 1
+
+    def brightness(self, percent):
+        return bytes([0x05, 0x55, 0xAA, 0xD1, 0x01, percent]).ljust(17, b"\0")
+
+    def image_reports(self, key, data):
+        page = 0
+        while data:
+            chunk, data = data[:1008], data[1008:]
+            header = bytes([0x02, 0x01, page, 0, 0 if data else 1, key + 1]).ljust(16, b"\0")
+            yield (header + chunk).ljust(1024, b"\0")
+            page += 1
+
+
+# Only the MK.2 was tried on a real deck. The others are written from what
+# other projects document of their protocol, and were only tried on
+# emulator.py.
+MODELS = [
+    Model("mk2", "Stream Deck MK.2", {0x006D, 0x0080, 0x00A5}, 5, 3, 72),  # and the Original V2
+    Model("xl", "Stream Deck XL", {0x006C, 0x008F}, 8, 4, 96),
+    PlusModel("plus", "Stream Deck +", {0x0084}, 4, 2, 120, turns=(), key_report=b"\x01\x00"),
+    NeoModel("neo", "Stream Deck Neo", {0x009A}, 4, 2, 96),
+    MiniModel("mini", "Stream Deck Mini", {0x0063, 0x0090}, 3, 2, 80,
+              turns=(Image.Transpose.ROTATE_90, Image.Transpose.FLIP_TOP_BOTTOM)),
+]
+MODEL_OF = {product: model for model in MODELS for product in model.products}
+WRITE_TIMEOUT = 2  # seconds a deck may take to accept a report
+
+
+class DeckBusy(OSError):
+    """An emulated deck that another daemon uses."""
+
+
+def find_decks():
+    """Path -> USB product id of every deck there is.
+
+    A deck that emulator.py stands in for is a socket, and its id is None
+    here: it tells its id once connected."""
+    found = {}
+    for dev in glob.glob("/sys/class/hidraw/hidraw*"):
         try:
-            self._feature(bytes([0x03, 0x08, BRIGHTNESS]))
+            with open(dev + "/device/uevent") as f:
+                uevent = f.read()
+        except OSError:
+            continue
+        m = re.search(r"HID_ID=\w+:(\w+):(\w+)", uevent)
+        if m and int(m[1], 16) == ELGATO_VENDOR and int(m[2], 16) in MODEL_OF:
+            found["/dev/" + os.path.basename(dev)] = int(m[2], 16)
+    for path in glob.glob(os.path.join(RUNTIME_DIR, "deck-*.sock")):
+        found[path] = None
+    return found
+
+
+class Deck:
+    """One deck, connected or emulated.
+
+    An emulated deck is sent the reports a real one is, each as one message
+    that starts with "O" for an output report or "F" for a feature report, and
+    sends the reports a real one does."""
+
+    def __init__(self, path, product=None):
+        self.path, self.emulated = path, product is None
+        if self.emulated:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as conn:
+                conn.settimeout(1)
+                conn.connect(path)
+                hello = conn.recv(64)  # its USB ids, as "0fd9:0080"
+                if not hello:
+                    raise DeckBusy("in use")
+                try:
+                    product = int(hello.split(b":")[-1], 16)
+                except ValueError:
+                    product = None
+                self.fd = conn.detach()
+            os.set_blocking(self.fd, False)
+        else:
+            self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            if product not in MODEL_OF:
+                raise OSError("not a model this program knows")
+            self.model = MODEL_OF[product]
+            self.pressed = {}                      # control -> the states it last reported
+            self.shown = [None] * self.model.keys
+            self.screen_shown = [None] * self.model.panels
+            self.slots = [None] * self.model.keys  # session shown on each key
+            self.brightness = BRIGHTNESS
+            self._feature(self.model.brightness(BRIGHTNESS))
         except OSError:
             self.close()
             raise
 
-    @staticmethod
-    def find():
-        for dev in glob.glob("/sys/class/hidraw/hidraw*"):
-            try:
-                with open(dev + "/device/uevent") as f:
-                    uevent = f.read()
-            except OSError:
-                continue
-            m = re.search(r"HID_ID=\w+:(\w+):(\w+)", uevent)
-            if m and int(m[1], 16) == ELGATO_VENDOR and int(m[2], 16) in PRODUCTS:
-                return "/dev/" + os.path.basename(dev)
-        return None
-
-    def _feature(self, payload):
-        buf = bytearray(payload.ljust(32, b"\0"))
+    def _feature(self, report):
+        if self.emulated:
+            return self._write(report, b"F")
+        buf = bytearray(report)
         hidiocsfeature = (3 << 30) | (len(buf) << 16) | (ord("H") << 8) | 0x06
         fcntl.ioctl(self.fd, hidiocsfeature, buf)
 
-    def _write(self, data):
+    def _write(self, report, kind=b"O"):
+        data = kind + report if self.emulated else report
         while True:
             try:
                 os.write(self.fd, data)
                 return
             except BlockingIOError:
-                select.select([], [self.fd], [], 1)
+                if not select.select([], [self.fd], [], WRITE_TIMEOUT)[1]:
+                    raise TimeoutError("it takes no data") from None
 
     def set_image(self, key, image):
         """Draw `image` on `key`; skipped if `image` is what is shown already."""
         pixels = image.tobytes()
         if self.shown[key] == pixels:
             return
+        for turn in self.model.turns:
+            image = image.transpose(turn)
         buf = io.BytesIO()
-        image.rotate(180).save(buf, "JPEG", quality=90)
-        data, page = buf.getvalue(), 0
-        while data:
-            chunk, data = data[:1016], data[1016:]
-            header = bytes([0x02, 0x07, key, 0 if data else 1,
-                            len(chunk) & 0xFF, len(chunk) >> 8,
-                            page & 0xFF, page >> 8])
-            self._write((header + chunk).ljust(1024, b"\0"))
-            page += 1
+        image.save(buf, self.model.image_format, quality=90)
+        for report in self.model.image_reports(key, buf.getvalue()):
+            self._write(report)
         self.shown[key] = pixels
 
-    def poll_presses(self, timeout):
-        """Wait up to `timeout` seconds; return keys that were newly pressed."""
-        presses = []
-        if not select.select([self.fd], [], [], timeout)[0]:
-            return presses
+    def set_screen(self, image):
+        """Draw `image` on the screen next to the keys; parts that show it already are skipped."""
+        model = self.model
+        for part in range(model.panels):
+            box = (part * image.width // model.panels, 0, (part + 1) * image.width // model.panels, image.height)
+            piece = image.crop(box)
+            pixels = piece.tobytes()
+            if self.screen_shown[part] == pixels:
+                continue
+            for turn in model.screen_turns:
+                piece = piece.transpose(turn)
+            buf = io.BytesIO()
+            piece.save(buf, "JPEG", quality=90)
+            for report in model.screen_reports(buf.getvalue(), box):
+                self._write(report)
+            self.screen_shown[part] = pixels
+
+    def dim(self, steps):
+        """Make the deck brighter by `steps`, or darker if they are negative."""
+        self.brightness = min(100, max(5, self.brightness + 5 * steps))
+        self._feature(self.model.brightness(self.brightness))
+
+    def clear(self):
+        for key in range(self.model.keys):
+            self.shown[key] = None
+            self.set_image(key, blank(self.model.size))
+        if self.model.screen:
+            self.screen_shown = [None] * self.model.panels
+            self.set_screen(Image.new("RGB", self.model.screen, (0, 0, 0)))
+
+    def events(self):
+        """What was done to the deck, from the reports that have arrived, as (control, value).
+
+        ("key", n), ("push", n) and ("pad", n) tell that key, dial or touch key n
+        was newly pressed; "turn" and "touch" are as Model.read() tells them."""
+        events = []
         while True:
             try:
-                report = os.read(self.fd, 512)
+                report = os.read(self.fd, 1024)
             except BlockingIOError:
                 break
-            if len(report) < 4 + KEYS or report[0] != 0x01:
-                continue
-            states = [bool(b) for b in report[4:4 + KEYS]]
-            presses += [k for k in range(KEYS) if states[k] and not self.pressed[k]]
-            self.pressed = states
-        return presses
+            if not report:
+                raise OSError("it is gone")
+            for control, value in self.model.read(report).items():
+                if control in ("turn", "touch"):
+                    events.append((control, value))
+                    continue
+                was = self.pressed.get(control) or [False] * len(value)
+                events += [(control, n) for n, down in enumerate(value) if down and not was[n]]
+                self.pressed[control] = value
+        return events
 
     def close(self):
         os.close(self.fd)
@@ -345,7 +542,10 @@ def fmt_tokens(n):
 
 # ------------------------------------------------------------- rendering ---
 
-SS = 4  # graphics are drawn supersampled and scaled down; text is drawn at 1x
+# The drawing is laid out for a key of UNIT pixels, and its measures are in
+# such pixels. Graphics are drawn at that size, supersampled, and scaled to
+# the key's; text is drawn on the result, its place and font size scaled.
+SS = 4  # graphics are drawn supersampled and scaled down; text is drawn at the key's size
 BASE = (16, 18, 22)
 ACCENT = {
     "busy": (255, 160, 40),
@@ -357,15 +557,31 @@ ANIMATED = {"busy", "waiting", "done"}
 _fonts = {}
 _fallback_file = None
 PAD = 4                      # pixels left free at a key's left and right edge
-NAME_WIDTH = SIZE - 2 * PAD  # room for the name
 TRACK = (48, 52, 60)         # the empty part of a bar
-_gradient = Image.linear_gradient("L").resize((SIZE * SS, SIZE * SS)).point(lambda v: 255 - v)
-BLANK = Image.new("RGB", (SIZE, SIZE), (0, 0, 0))
+_gradient = Image.linear_gradient("L").resize((UNIT * SS, UNIT * SS)).point(lambda v: 255 - v)
+_blanks = {}
+
+
+def blank(size):
+    """An empty key of `size` pixels."""
+    if size not in _blanks:
+        _blanks[size] = Image.new("RGB", (size, size), (0, 0, 0))
+    return _blanks[size]
+
+
+def scaler(size):
+    """A function that gives the pixels on a key of `size` for a measure of the layout."""
+    return lambda v: round(v * size / UNIT)
+
+
+def name_width(size):
+    """Pixels of room for the name on a key of `size`."""
+    return size - 2 * scaler(size)(PAD)
 
 
 def background(accent, tint):
     """A key's supersampled background: `accent` at the top, fading out towards the bottom."""
-    big = SIZE * SS
+    big = UNIT * SS
     return Image.composite(Image.new("RGB", (big, big), mix(BASE, accent, tint)),
                            Image.new("RGB", (big, big), BASE), _gradient)
 
@@ -418,15 +634,16 @@ NAME_SIZE = 15  # font size of the name; the widest model name, "Sonnet 5.5", ju
 SCROLL_FPS = 6  # frames per second while only names scroll
 
 
-def name_scroll(name, t):
-    """(pixels a name too wide for its key is moved left at time `t`, whether it is moving).
+def name_scroll(name, t, size=UNIT):
+    """(pixels a name too wide for a key of `size` is moved left at time `t`, whether it is moving).
 
     Each time the name appears it rests for a second, moves until its end shows and rests there."""
-    over = font(NAME_SIZE).getlength(name) - NAME_WIDTH
+    px = scaler(size)
+    over = font(px(NAME_SIZE)).getlength(name) - name_width(size)
     if over <= 0:
         return 0, False
     shown = MODEL_EVERY - MODEL_SECONDS            # seconds the name is shown for
-    moves = min(over / 16, shown - 2)              # at 16 px a second, faster if that takes too long
+    moves = min(over / px(16), shown - 2)          # at 16 px a second, faster if that takes too long
     done = (t % MODEL_EVERY - 1) / moves
     return round(over * min(1, max(0, done))), 0 < done < 1
 
@@ -490,7 +707,7 @@ def draw_mascot(g, kind, phase, top, bottom):
     `top`/`bottom` bound the area it may use (1x pixels)."""
     px = 4 if bottom - top >= 34 else 3
     w, h = MASCOT_COLS * px, MASCOT_ROWS * px
-    centre = (SIZE - w) / 2
+    centre = (UNIT - w) / 2
     floor = round(top + (bottom - top - h) / 2)  # stands centred in its area
     if kind == "think":  # leave room for the dots over its head
         floor = min(bottom - h, max(floor, top + 2 * px + 1))
@@ -502,7 +719,7 @@ def draw_mascot(g, kind, phase, top, bottom):
         if phase < walk:
             draw_sprite(g, -w + (centre + w) * phase / walk, floor - step, px, feet=step)
         elif left < walk:
-            draw_sprite(g, centre + (SIZE - centre) * (1 - left / walk), floor - step, px, feet=step)
+            draw_sprite(g, centre + (UNIT - centre) * (1 - left / walk), floor - step, px, feet=step)
         else:
             hop = abs(math.sin((phase - walk) * math.pi / 0.7)) * min(5, floor - top)
             draw_sprite(g, centre, floor - hop, px, blink=(phase - walk) % 1.4 > 1.25)
@@ -510,7 +727,7 @@ def draw_mascot(g, kind, phase, top, bottom):
 
     # The others rise from the bottom edge and sink back at the end.
     rise = min(1.0, phase / 0.5, left / 0.5)
-    y = floor + (SIZE - floor) * (1 - rise)
+    y = floor + (UNIT - floor) * (1 - rise)
     inner = phase - 0.5
     if kind == "think":  # looks around while dots pop up over its head
         look = (0, -1, 0, 1)[int(inner / 0.9) % 4] if rise == 1 else 0
@@ -535,28 +752,30 @@ def draw_mascot(g, kind, phase, top, bottom):
         draw_sprite(g, centre, y - bounce, px, arms=arms, blink=inner % 1.8 > 1.65)
 
 
-def render(info, t):
-    """Key image for a session; `t` (seconds) drives the animations."""
+def render(info, t, size=UNIT):
+    """Image of `size` pixels for a session's key; `t` (seconds) drives the animations."""
     state = info["state"]
     # Now and then the model takes the place of the session's name, on all keys at once.
     show_model = bool(info["model"]) and t % MODEL_EVERY >= MODEL_EVERY - MODEL_SECONDS
-    name_font = font(NAME_SIZE)
-    name = fit(info["model"], name_font, NAME_WIDTH) if show_model else info["name"]
-    shift = name_scroll(name, t)[0]
+    name_font = font(scaler(size)(NAME_SIZE))
+    name = fit(info["model"], name_font, name_width(size)) if show_model else info["name"]
+    shift = name_scroll(name, t, size)[0]
     if state not in ANIMATED:  # then only these make one image differ from the next
-        drawn = (tuple(info.items()), name, shift)
+        drawn = (tuple(info.items()), name, shift, size)
         if drawn not in _still:
-            if len(_still) > 4 * KEYS:
+            if len(_still) > STILL_KEYS:
                 _still.clear()
-            _still[drawn] = draw_key(info, t, show_model, name, shift)
+            _still[drawn] = draw_key(info, t, show_model, name, shift, size)
         return _still[drawn]
-    return draw_key(info, t, show_model, name, shift)
+    return draw_key(info, t, show_model, name, shift, size)
 
 
 _still = {}  # what a key without animation was drawn from -> its image
+STILL_KEYS = 200  # how many of these are kept
 
 
-def draw_key(info, t, show_model, name, shift):
+def draw_key(info, t, show_model, name, shift, size):
+    px = scaler(size)
     state = info["state"]
     accent = ACCENT.get(state, ACCENT["idle"])
     pulse = 0.0
@@ -576,13 +795,13 @@ def draw_key(info, t, show_model, name, shift):
         rng = random.Random(f"{info['offset']}:{appearance}")
         kind = rng.choices(list(MASCOT_ANIMATIONS), weights=MASCOT_ANIMATIONS.values())[0]
 
-    big = SIZE * SS
+    big = UNIT * SS
     img = background(accent, tint)
     g = ImageDraw.Draw(img)
-    name_font = font(NAME_SIZE)
+    name_font = font(px(NAME_SIZE))
     name_bottom = 5 + NAME_SIZE
-    small = font(10, "Condensed Medium")
-    time_y = SIZE - SAFE_BOTTOM - 9   # centre of the time row
+    small = font(px(10), "Condensed Medium")
+    time_y = UNIT - SAFE_BOTTOM - 9   # centre of the time row
     bar_y = time_y - 14               # centre of the context bar
 
     # --- graphics, supersampled ---------------------------------------------
@@ -596,19 +815,19 @@ def draw_key(info, t, show_model, name, shift):
             g.rectangle((x1, 0, x1 + seg / 12, bar),
                         fill=mix(mix(accent, (255, 255, 255), 0.45), mix(BASE, accent, 0.55), i / 12))
     if mascot is not None:
-        draw_mascot(g, kind, mascot, name_bottom + 2, SIZE - SAFE_BOTTOM)
+        draw_mascot(g, kind, mascot, name_bottom + 2, UNIT - SAFE_BOTTOM)
     else:
         draw_icon(g, state, PAD, time_y - round(MASCOT_ROWS * ICON_PX / 2), accent, t)
-        if info["tokens"]:
-            x2 = (SIZE - PAD - small.getlength(info["tokens"]) - 4) * SS
+        if info["tokens"]:  # the bar ends where the number next to it starts
+            x2 = (UNIT - PAD - small.getlength(info["tokens"]) * UNIT / size - 4) * SS
             box = (PAD * SS, (bar_y - 2) * SS, x2, (bar_y + 2) * SS)
             g.rounded_rectangle(box, 2 * SS, fill=TRACK)
             used = min(1.0, info["context"])
             g.rounded_rectangle((box[0], box[1], box[0] + max(4 * SS, (x2 - box[0]) * used), box[3]),
                                 2 * SS, fill=level_color(used, (165, 172, 185)))
-    img = img.resize((SIZE, SIZE), Image.LANCZOS)
+    img = img.resize((size, size), Image.LANCZOS)
 
-    # --- text, at 1x --------------------------------------------------------
+    # --- text, at the key's size ----------------------------------------------
     d = ImageDraw.Draw(img)
     dim = (150, 156, 168) if state != "idle" else (110, 116, 128)
     soft = mix(accent, (255, 255, 255), 0.25)
@@ -616,23 +835,23 @@ def draw_key(info, t, show_model, name, shift):
     if show_model:  # tinted, to tell it from the name
         color = mix(accent, color, 0.35)
     # The name is drawn on its own strip, which cuts off what is scrolled out of it.
-    box = (PAD, 0, PAD + NAME_WIDTH, name_bottom + 4)
+    box = (px(PAD), 0, px(PAD) + name_width(size), px(name_bottom + 4))
     strip = img.crop(box)
-    if mascot is not None and name_font.getlength(name) <= NAME_WIDTH:  # centred like the mascot below it
-        ImageDraw.Draw(strip).text((strip.width / 2, 5), name, font=name_font, fill=color, anchor="ma")
+    if mascot is not None and name_font.getlength(name) <= strip.width:  # centred like the mascot below it
+        ImageDraw.Draw(strip).text((strip.width / 2, px(5)), name, font=name_font, fill=color, anchor="ma")
     else:
-        ImageDraw.Draw(strip).text((-shift, 5), name, font=name_font, fill=color)
+        ImageDraw.Draw(strip).text((-shift, px(5)), name, font=name_font, fill=color)
     img.paste(strip, box)
     if mascot is not None:
         return img
-    big_font = font(18)
+    big_font = font(px(18))
     time_x = PAD + round(MASCOT_COLS * ICON_PX) + 3
-    d.text((time_x, time_y), info["elapsed"], font=big_font,
+    d.text((px(time_x), px(time_y)), info["elapsed"], font=big_font,
            fill=mix(accent, (255, 255, 255), 0.3), anchor="lm")
     if info["activity"]:
-        line = font(11, "Condensed Medium")
-        d.text((PAD, name_bottom + 1), fit(info["activity"], line, NAME_WIDTH), font=line, fill=soft)
-    d.text((SIZE - PAD, bar_y), info["tokens"], font=small, fill=dim, anchor="rm")
+        line = font(px(11), "Condensed Medium")
+        d.text((px(PAD), px(name_bottom + 1)), fit(info["activity"], line, name_width(size)), font=line, fill=soft)
+    d.text((size - px(PAD), px(bar_y)), info["tokens"], font=small, fill=dim, anchor="rm")
     return img
 
 
@@ -660,10 +879,16 @@ def account_usage():
     return windows
 
 
-def render_usage():
-    """Key showing how much of the account's usage limits is used."""
+def fmt_reset(left):
+    """Time until a usage window resets, in whole hours once minutes stop mattering."""
+    return f"{int(left // 3600)}h" if 10 * 3600 <= left < 2 * 86400 else fmt_duration(left)
+
+
+def render_usage(size=UNIT):
+    """Image of `size` pixels for the key that shows how much of the account's usage limits is used."""
+    px = scaler(size)
     windows = account_usage()
-    big = SIZE * SS
+    big = UNIT * SS
     worst = max((used for _, used, _ in windows), default=0)
     accent = level_color(worst, MASCOT_COLOR)
     img = background(accent, 0.14)
@@ -671,26 +896,146 @@ def render_usage():
     g.rectangle((0, 0, big, 3 * SS), fill=mix(BASE, accent, 0.7))
     rows = [7 + i * 27 for i in range(len(windows))]  # top of each window's block
     for y, (_, used, _) in zip(rows, windows):
-        box = (PAD * SS, (y + 16) * SS, (SIZE - PAD) * SS, (y + 21) * SS)
+        box = (PAD * SS, (y + 16) * SS, (UNIT - PAD) * SS, (y + 21) * SS)
         g.rounded_rectangle(box, 2.5 * SS, fill=TRACK)
         g.rounded_rectangle((box[0], box[1], box[0] + max(5 * SS, (box[2] - box[0]) * min(1, used)),
                              box[3]), 2.5 * SS, fill=level_color(used, MASCOT_COLOR))
-    img = img.resize((SIZE, SIZE), Image.LANCZOS)
+    img = img.resize((size, size), Image.LANCZOS)
     d = ImageDraw.Draw(img)
     dim = (150, 156, 168)
+    small = font(px(10), "Condensed Medium")
     if not windows:
-        d.text((SIZE / 2, 24), "usage", font=font(15), fill=(255, 255, 255), anchor="mm")
-        d.text((SIZE / 2, 42), "no data yet", font=font(10, "Condensed Medium"), fill=dim, anchor="mm")
+        d.text((size / 2, px(24)), "usage", font=font(px(15)), fill=(255, 255, 255), anchor="mm")
+        d.text((size / 2, px(42)), "no data yet", font=small, fill=dim, anchor="mm")
         return img
-    small = font(10, "Condensed Medium")
     for y, (name, used, left) in zip(rows, windows):
-        d.text((PAD, y + 13), name, font=font(11), fill=(255, 255, 255), anchor="ls")
-        x = PAD + font(11).getlength(name) + 3
-        # Time until the window resets, in whole hours once minutes stop mattering.
-        reset = f"{int(left // 3600)}h" if 10 * 3600 <= left < 2 * 86400 else fmt_duration(left)
-        d.text((x, y + 13), reset, font=small, fill=dim, anchor="ls")
-        d.text((SIZE - PAD, y + 13), f"{round(used * 100)}%", font=font(15), fill=(255, 255, 255), anchor="rs")
+        d.text((px(PAD), px(y + 13)), name, font=font(px(11)), fill=(255, 255, 255), anchor="ls")
+        x = px(PAD) + font(px(11)).getlength(name) + px(3)
+        d.text((x, px(y + 13)), fmt_reset(left), font=small, fill=dim, anchor="ls")
+        d.text((size - px(PAD), px(y + 13)), f"{round(used * 100)}%", font=font(px(15)),
+               fill=(255, 255, 255), anchor="rs")
     return img
+
+
+# The screen next to the keys of some models shows how many sessions are in
+# each of these states, then the account usage. On the +, each has a panel of
+# its own over a dial.
+PANELS = ("waiting", "done", "busy")
+PANEL_NAMES = {"waiting": "needs you", "done": "done", "busy": "working"}
+_screens = {}  # what a screen was drawn from -> its image
+
+
+def render_screen(model, counts):
+    """Image for a model's screen; `counts` are the sessions in each of PANELS' states."""
+    windows = account_usage()
+    drawn = (model.id, tuple(counts), tuple((name, round(used * 100), fmt_reset(left))
+                                            for name, used, left in windows))
+    if drawn not in _screens:
+        if len(_screens) > 20:
+            _screens.clear()
+        _screens[drawn] = (draw_panels if model.panels > 1 else draw_compact)(model.screen, counts, windows)
+    return _screens[drawn]
+
+
+def draw_screen(size, graphics):
+    """An image of `size` with `graphics(g)` drawn supersampled, then the texts it returns.
+
+    A text is (place, text, font, colour, anchor)."""
+    img = Image.new("RGB", (size[0] * SS, size[1] * SS), BASE)
+    texts = graphics(img, ImageDraw.Draw(img))
+    img = img.resize(size, Image.LANCZOS)
+    d = ImageDraw.Draw(img)
+    for xy, text, fnt, fill, anchor in texts:
+        d.text(xy, text, font=fnt, fill=fill, anchor=anchor)
+    return img
+
+
+def draw_panels(size, counts, windows):
+    """A wide screen: a panel for each of PANELS and one for the account usage."""
+    (w, h), parts = size, len(PANELS) + 1
+    pw = w // parts - 2  # two pixels stay empty between panels
+    white, dim, grey = (255, 255, 255), (150, 156, 168), (110, 116, 128)
+
+    def graphics(img, g):
+        texts = []
+
+        def panel(part, accent, tint, bar):
+            x = part * w // parts
+            img.paste(background(accent, tint).resize((pw * SS, h * SS)), (x * SS, 0))
+            g.rectangle((x * SS, 0, (x + pw) * SS - 1, 3 * SS), fill=mix(BASE, accent, bar))
+            return x
+
+        for part, (state, count) in enumerate(zip(PANELS, counts)):
+            accent = ACCENT[state] if count else ACCENT["idle"]
+            x = panel(part, accent, 0.24 if count else 0.07, 0.9 if count else 0.55)
+            color = mix(MASCOT_COLOR, (70, 74, 84), 0.6) if not count \
+                else mix(accent, white, 0.35) if state == "waiting" else None
+            draw_sprite(g, x + pw - 12 - MASCOT_COLS * 5, 46, 5, blink=not count, color=color,
+                        arms=(1, 1) if count and state != "busy" else (0, 0))
+            texts.append(((x + 12, 12), PANEL_NAMES[state], font(17, "Condensed Medium"),
+                          mix(accent, white, 0.25) if count else grey, "la"))
+            texts.append(((x + 12, 64), str(count), font(50), white if count else grey, "lm"))
+
+        worst = max((used for _, used, _ in windows), default=0)
+        x = panel(parts - 1, level_color(worst, MASCOT_COLOR), 0.14, 0.7)
+        if not windows:
+            texts.append(((x + pw / 2, 40), "usage", font(22), white, "mm"))
+            texts.append(((x + pw / 2, 64), "no data yet", font(15, "Condensed Medium"), dim, "mm"))
+        for row, (name, used, left) in enumerate(windows):
+            y = 14 + row * 40
+            box = ((x + 12) * SS, (y + 24) * SS, (x + pw - 12) * SS, (y + 31) * SS)
+            g.rounded_rectangle(box, 3.5 * SS, fill=TRACK)
+            g.rounded_rectangle((box[0], box[1], box[0] + max(7 * SS, (box[2] - box[0]) * min(1, used)),
+                                 box[3]), 3.5 * SS, fill=level_color(used, MASCOT_COLOR))
+            texts.append(((x + 12, y + 18), name, font(17), white, "ls"))
+            texts.append(((x + 12 + font(17).getlength(name) + 5, y + 18), fmt_reset(left),
+                          font(15, "Condensed Medium"), dim, "ls"))
+            texts.append(((x + pw - 12, y + 18), f"{round(used * 100)}%", font(22), white, "rs"))
+        return texts
+
+    return draw_screen(size, graphics)
+
+
+def draw_compact(size, counts, windows):
+    """A small screen: the counts of PANELS' states side by side, then the account usage."""
+    w, h = size
+    col = w // 6  # the counts take half the width
+    white, dim, grey = (255, 255, 255), (150, 156, 168), (95, 100, 112)
+
+    def graphics(img, g):
+        texts = []
+        for part, (state, count) in enumerate(zip(PANELS, counts)):
+            x, accent = part * col, ACCENT[state]
+            if count:
+                g.rectangle(((x + 3) * SS, 0, (x + col - 3) * SS, 2 * SS), fill=accent)
+            texts.append(((x + col / 2, h * 0.42), str(count), font(24), accent if count else grey, "mm"))
+            texts.append(((x + col / 2, h * 0.8), fit(PANEL_NAMES[state], font(10, "Condensed Medium"), col - 2),
+                          font(10, "Condensed Medium"), dim if count else grey, "mm"))
+        left_edge, right_edge = 3 * col + 8, w - 4
+        if not windows:
+            texts.append((((left_edge + right_edge) / 2, h / 2), "no usage data",
+                          font(11, "Condensed Medium"), dim, "mm"))
+        for row, (name, used, _) in enumerate(windows):
+            y = 5 + row * (h - 6) // 2
+            box = (left_edge * SS, (y + 14) * SS, right_edge * SS, (y + 18) * SS)
+            g.rounded_rectangle(box, 2 * SS, fill=TRACK)
+            g.rounded_rectangle((box[0], box[1], box[0] + max(4 * SS, (box[2] - box[0]) * min(1, used)),
+                                 box[3]), 2 * SS, fill=level_color(used, MASCOT_COLOR))
+            texts.append(((left_edge, y + 11), name, font(11), white, "ls"))
+            texts.append(((right_edge, y + 11), f"{round(used * 100)}%", font(12), white, "rs"))
+        return texts
+
+    return draw_screen(size, graphics)
+
+
+_usage_keys = {}  # size -> (when it was drawn, the image)
+
+
+def usage_key(size, now):
+    """render_usage(), drawn anew once a second: it shows nothing finer than seconds."""
+    if size not in _usage_keys or now - _usage_keys[size][0] >= 1:
+        _usage_keys[size] = (now, render_usage(size))
+    return _usage_keys[size][1]
 
 
 # ------------------------------------------------------------- sandboxes ---
@@ -1342,101 +1687,190 @@ SCAN_INTERVAL = 0.25  # seconds between looks at the sessions: often, to catch r
 JUST_STARTED = 15     # seconds after its start in which a session's window is taken to have the focus
 
 
-def run(deck):
-    slots = [None] * KEYS   # session shown on each key
-    last_status = {}        # session -> status last seen
-    since = {}              # session -> epoch seconds the status was entered
-    unseen = set()          # sessions that finished and were not visited yet
-    infos = [None] * KEYS
-    next_frame = next_scan = usage_until = 0.0
-    sessions = {}
-    while True:
-        for key in deck.poll_presses(max(0.0, next_frame - time.monotonic())):
-            sid = slots[key]
-            if sid in sessions:
-                unseen.discard(sid)
-                attempt(focus, sessions[sid])
-                next_scan = 0.0
-        now = time.monotonic()
-        if now < next_frame:
+class Sessions:
+    """The live sessions and what their keys show; the same for every deck."""
+
+    def __init__(self):
+        self.sessions = {}     # as load_sessions() returns them
+        self.order = []        # their keys, oldest session first
+        self.infos = {}        # session -> key_info() of it
+        self.last_status = {}  # session -> status last seen
+        self.since = {}        # session -> epoch seconds the status was entered
+        self.unseen = set()    # sessions that finished and were not visited yet
+        self.cursor = None     # session that visit_next() went to last
+
+    def scan(self):
+        sessions = self.sessions = load_sessions()
+        for sid in set(self.last_status) - set(sessions):  # ended sessions
+            self.unseen.discard(sid)
+            self.last_status.pop(sid, None)
+            self.since.pop(sid, None)
+        live_ids = {s["sessionId"] for s in sessions.values()}
+        for stale in set(_transcripts) - live_ids:
+            del _transcripts[stale]
+        # Oldest session first, so later ones move up when a session ends.
+        self.order = sorted(sessions, key=lambda sid: sessions[sid].get("startedAt") or 0)
+        self.infos = {}
+        for place, sid in enumerate(self.order):
+            session = sessions[sid]
+            status = session.get("status", "?")
+            previous = self.last_status.get(sid)
+            if status != previous:
+                if status == "idle" and previous == "busy":
+                    self.unseen.add(sid)
+                # A session that just started or got a prompt has the focus now.
+                just_started = previous is None and \
+                    time.time() - (session.get("startedAt") or 0) / 1000 < JUST_STARTED
+                if just_started or (status == "busy" and previous in ("idle", "waiting")):
+                    attempt(learn_window, session, set(sessions))
+                stamp = session.get("statusUpdatedAt") or session.get("startedAt")
+                self.since[sid] = stamp / 1000 if stamp else time.time()
+                self.last_status[sid] = status
+            if status != "idle":
+                self.unseen.discard(sid)
+            # The offset keeps the keys from showing the mascot in sync.
+            self.infos[sid] = key_info(session, "done" if sid in self.unseen else status,
+                                       self.since[sid], place * 7.3)
+
+    def visit(self, sid):
+        """Jump to a session's window; returns whether there is such a session."""
+        if sid not in self.sessions:
+            return False
+        self.unseen.discard(sid)
+        attempt(focus, self.sessions[sid])
+        return True
+
+    def visit_next(self, state):
+        """Jump to the next session in `state`, after the one last jumped to this way."""
+        found = [sid for sid in self.order if self.infos[sid]["state"] == state]
+        if not found:
+            return False
+        after = self.order.index(self.cursor) if self.cursor in self.order else -1
+        self.cursor = next((sid for sid in found if self.order.index(sid) > after), found[0])
+        return self.visit(self.cursor)
+
+    def counts(self):
+        """How many sessions are in each of PANELS' states."""
+        states = [info["state"] for info in self.infos.values()]
+        return [states.count(state) for state in PANELS]
+
+
+def show(deck, board, now, frames):
+    """Draw the sessions on a deck's keys; returns the frames a second that this needs.
+
+    `frames` holds the images drawn for this moment, which decks with keys of one size share."""
+    keys, size = deck.model.keys, deck.model.size
+    # Keys fill in order. The account usage is on the deck's screen, or on the last key if it has none.
+    usage = None if deck.model.screen else keys - 1
+    deck.slots = (board.order + [None] * keys)[:keys]
+    if deck.model.screen:
+        deck.set_screen(render_screen(deck.model, board.counts()))
+    else:
+        deck.slots[usage] = None
+    rate = 2
+    for key, sid in enumerate(deck.slots):
+        info = board.infos.get(sid)
+        if key == usage:
+            image = usage_key(size, now)
+        elif info is None:
+            image = blank(size)
+        else:
+            if (sid, size) not in frames:
+                frames[sid, size] = render(info, now, size)
+            image = frames[sid, size]
+            rate = max(rate, FPS if info["state"] in ANIMATED
+                       else SCROLL_FPS if name_scroll(info["name"], now, size)[1] else 0)
+        deck.set_image(key, image)
+    return rate
+
+
+def act(deck, board, control, value):
+    """Do what a press, turn or touch on a deck asks for; returns whether it jumped to a session."""
+    model = deck.model
+    if control == "key":
+        return board.visit(deck.slots[value])
+    if control == "turn":  # any dial sets the brightness
+        deck.dim(sum(value))
+        return False
+    if control == "touch":  # counts as a push of the dial under it
+        value = value[0] * model.panels // model.screen[0]
+    if control == "pad" or model.panels == 1:  # to whichever session needs the user most
+        return board.visit_next("waiting") or board.visit_next("done")
+    return value < len(PANELS) and board.visit_next(PANELS[value])
+
+
+DECK_INTERVAL = 2  # seconds between looks for decks that appeared
+
+
+def attach(decks, errors):
+    """Open the decks that appeared. `errors` holds what was last logged about each path."""
+    found = find_decks()
+    for path in set(errors) - set(found):
+        del errors[path]
+    for path, product in found.items():
+        if path in decks:
             continue
-
-        if now >= next_scan:
-            next_scan = now + SCAN_INTERVAL
-            sessions = load_sessions()
-            for sid in set(last_status) - set(sessions):  # ended sessions
-                unseen.discard(sid)
-                last_status.pop(sid, None)
-                since.pop(sid, None)
-            live_ids = {s["sessionId"] for s in sessions.values()}
-            for stale in set(_transcripts) - live_ids:
-                del _transcripts[stale]
-            # Oldest session first, so later ones move up when a session ends.
-            order = sorted(sessions, key=lambda sid: sessions[sid].get("startedAt") or 0)
-            slots = (order + [None] * KEYS)[:KEYS]
-            slots[USAGE_KEY] = None  # reserved for the account usage
-            for key, sid in enumerate(slots):
-                if not sid:
-                    infos[key] = None
-                    continue
-                session = sessions[sid]
-                status = session.get("status", "?")
-                previous = last_status.get(sid)
-                if status != previous:
-                    if status == "idle" and previous == "busy":
-                        unseen.add(sid)
-                    # A session that just started or got a prompt has the focus now.
-                    just_started = previous is None and \
-                        time.time() - (session.get("startedAt") or 0) / 1000 < JUST_STARTED
-                    if just_started or (status == "busy" and previous in ("idle", "waiting")):
-                        attempt(learn_window, session, set(sessions))
-                    stamp = session.get("statusUpdatedAt") or session.get("startedAt")
-                    since[sid] = stamp / 1000 if stamp else time.time()
-                    last_status[sid] = status
-                if status != "idle":
-                    unseen.discard(sid)
-                # The offset keeps the keys from showing the mascot in sync.
-                infos[key] = key_info(session, "done" if sid in unseen else status, since[sid], key * 7.3)
-
-        animated = scrolling = False
-        for key, info in enumerate(infos):
-            if key == USAGE_KEY:
-                if now >= usage_until:  # it shows nothing finer than seconds
-                    usage, usage_until = render_usage(), now + 1
-                deck.set_image(key, usage)
-            elif info is None:
-                deck.set_image(key, BLANK)
-            else:
-                animated |= info["state"] in ANIMATED
-                scrolling |= name_scroll(info["name"], now)[1]
-                deck.set_image(key, render(info, now))
-        next_frame = now + (1 / FPS if animated else 1 / SCROLL_FPS if scrolling else 0.5)
+        try:
+            decks[path] = Deck(path, product)
+            error = None
+            log(f"using {decks[path].model.name} at {path}")
+        except (ConnectionRefusedError, DeckBusy):  # an emulator that ended, or one another daemon uses
+            continue
+        except OSError as e:  # not accessible yet, for example
+            error = str(e)
+        if error != errors.get(path):
+            errors[path] = error
+            if error:
+                log(f"cannot use {path}: {error}")
 
 
 def main():
     threading.Thread(target=watch_sandboxes, daemon=True).start()
-    while True:
-        path = Deck.find()
-        if not path:
-            time.sleep(3)
-            continue
-        deck = None
-        try:
-            deck = Deck(path)
-            log("using", path)
-            run(deck)
-        except OSError as e:  # unplugged, or not accessible yet
-            log("deck error:", e)
-            time.sleep(3)
-        finally:
-            if deck:
+    decks, errors = {}, {}  # both by path
+    board = Sessions()
+    next_frame = next_scan = next_look = 0.0
+
+    def lose(deck, error):  # unplugged, or its emulator ended
+        log(f"lost {deck.path}: {error}")
+        deck.close()
+        del decks[deck.path]
+
+    try:
+        while True:
+            by_fd = {deck.fd: deck for deck in decks.values()}
+            for fd in select.select(list(by_fd), [], [], max(0.0, next_frame - time.monotonic()))[0]:
                 try:
-                    for key in range(KEYS):
-                        deck.shown[key] = None
-                        deck.set_image(key, BLANK)
-                except OSError:
-                    pass
-                deck.close()
+                    for control, value in by_fd[fd].events():
+                        if act(by_fd[fd], board, control, value):
+                            next_scan = 0.0
+                except OSError as e:
+                    lose(by_fd[fd], e)
+            now = time.monotonic()
+            if now < next_frame:
+                continue
+            if now >= next_look:
+                next_look = now + DECK_INTERVAL
+                attach(decks, errors)
+            if not decks:
+                next_frame = next_look
+                continue
+            if now >= next_scan:
+                next_scan = now + SCAN_INTERVAL
+                board.scan()
+            rate, frames = 2, {}
+            for deck in list(decks.values()):
+                try:
+                    rate = max(rate, show(deck, board, now, frames))
+                except OSError as e:
+                    lose(deck, e)
+            next_frame = now + 1 / rate
+    finally:
+        for deck in decks.values():
+            try:
+                deck.clear()
+            except OSError:
+                pass
+            deck.close()
 
 
 # white, red, yellow, green, blue
@@ -1444,29 +1878,39 @@ CALIBRATION_BANDS = [(255, 255, 255), (230, 40, 40), (240, 220, 0), (0, 190, 70)
 CALIBRATION_BAND_PX = 3
 
 
-def calibrate():
-    """Show nested colour frames on every key, revealing how much the keycaps hide."""
-    img = Image.new("RGB", (SIZE, SIZE), (0, 0, 0))
+def calibration_image(size):
+    img = Image.new("RGB", (size, size), (0, 0, 0))
     d = ImageDraw.Draw(img)
     for i, color in enumerate(CALIBRATION_BANDS):
         inset = i * CALIBRATION_BAND_PX
-        d.rectangle((inset, inset, SIZE - 1 - inset, SIZE - 1 - inset), fill=color)
+        d.rectangle((inset, inset, size - 1 - inset, size - 1 - inset), fill=color)
     inset = len(CALIBRATION_BANDS) * CALIBRATION_BAND_PX
-    d.rectangle((inset, inset, SIZE - 1 - inset, SIZE - 1 - inset), fill=(0, 0, 0))
-    d.line((SIZE // 2, inset, SIZE // 2, SIZE - 1 - inset), fill=(90, 90, 90))
-    d.line((inset, SIZE // 2, SIZE - 1 - inset, SIZE // 2), fill=(90, 90, 90))
-    path = Deck.find()
-    if not path:
+    d.rectangle((inset, inset, size - 1 - inset, size - 1 - inset), fill=(0, 0, 0))
+    d.line((size // 2, inset, size // 2, size - 1 - inset), fill=(90, 90, 90))
+    d.line((inset, size // 2, size - 1 - inset, size // 2), fill=(90, 90, 90))
+    return img
+
+
+def calibrate():
+    """Show nested colour frames on every key of every deck, revealing how much the keycaps hide."""
+    decks = []
+    for path, product in find_decks().items():
+        try:
+            decks.append(Deck(path, product))
+        except OSError as e:
+            log(f"cannot use {path}: {e}")
+    if not decks:
         sys.exit("no Stream Deck found")
-    deck = Deck(path)
-    for key in range(KEYS):
-        deck.set_image(key, img)
+    for deck in decks:
+        for key in range(deck.model.keys):
+            deck.set_image(key, calibration_image(deck.model.size))
     print("Test pattern is showing. Press Ctrl+C to end.")
     try:
         while True:
             time.sleep(1)
     finally:
-        deck.close()
+        for deck in decks:
+            deck.close()
 
 
 if __name__ == "__main__":
