@@ -2,8 +2,8 @@
 
 Shows every running [Claude Code](https://claude.com/claude-code) session on an
 Elgato Stream Deck: one key per session, with its live state. Pressing a key
-jumps to the window that session runs in and, in JetBrains IDEs, to its
-terminal tab.
+jumps to the window that session runs in and, in JetBrains IDEs and Ptyxis, to
+its terminal tab.
 
 ![Rendering of a Stream Deck with eight example sessions and the usage key](docs/preview.png)
 
@@ -27,7 +27,7 @@ It does:
   time in that state, and for the account its usage limits.
 - Jump to a session's window when its key is pressed, on the
   [desktops](#jumping-to-a-session) it knows, and to its terminal tab in
-  JetBrains IDEs.
+  JetBrains IDEs and in Ptyxis.
 - Drive several decks of different [models](#decks) at once, real or emulated.
 - Take [plugins](#extending) for other places to find sessions, other
   desktops, other terminals and IDEs, other sandboxes and other deck models.
@@ -45,7 +45,7 @@ It does not:
   with another `CLAUDE_CONFIG_DIR` needs a [one-line plugin](#extending).
 - **Show more sessions than a deck has keys.** The oldest are shown, the rest
   are left out, and there are no pages.
-- **Select the tab or pane** in anything but a JetBrains IDE. Elsewhere it
+- **Select the tab or pane** in anything but a JetBrains IDE or Ptyxis. Elsewhere it
   raises the window, and may pick the wrong one of several: see the
   [limits](#which-window-is-chosen). Inside `tmux` or `screen` a session's
   processes do not lead to a terminal window at all, so the window can only be
@@ -56,8 +56,8 @@ It does not:
 - **Run on anything but Linux** with systemd user services.
 - **Promise to keep working.** It reads files that are internal to Claude Code
   and may change with any update; and of the decks only the MK.2, of the
-  desktops only GNOME on Wayland and of the tools only IntelliJ IDEA were tried
-  for real.
+  desktops only GNOME on Wayland and of the tools only IntelliJ IDEA and
+  Ptyxis 50 were tried for real.
 
 ## What the keys show
 
@@ -371,6 +371,29 @@ it can do more:
 | Tool | Extra | Needs |
 |---|---|---|
 | JetBrains IDEs (IntelliJ IDEA, PyCharm, Android Studio, …) | Selects the session's tab in the Terminal tool window and raises the right project window | The plugin from `jetbrains-plugin/`, the IDE's current terminal (not the Classic one) |
+| Ptyxis (the "Terminal" of Ubuntu and Fedora) | Selects the session's tab | Up to Ptyxis 50: PyGObject with the AT-SPI bindings (`gir1.2-atspi-2.0` on Ubuntu) |
+
+**Ptyxis** up to version 50 has no way to ask for the tab of a shell, so the
+daemon uses what Ptyxis tells screen readers: the titles of a window's tabs,
+and a step to the next or previous tab. Titles need not differ, so the daemon
+writes a title of its own to the session's terminal, sees which tab takes it,
+sets the old title back and steps to that tab, taking all steps at once so
+that the tabs in between do not show. This takes about 0.2 s. The title is
+written into what the session prints; should that ever fall into the middle of
+something the session is printing, the terminal can show stray characters
+once. Tried with Ptyxis 50.
+
+A newer Ptyxis tells the shell of each tab the ID of that tab, in the
+environment variable `PTYXIS_TAB`; at the time of writing only its development
+version does. The daemon reads it from the shell's `/proc/<pid>/environ` and
+asks Ptyxis for that tab over D-Bus (`focus-tab-by-uuid`). That takes a few
+milliseconds, writes nothing to the terminal and needs no AT-SPI bindings.
+Ptyxis does not tell which of its windows holds the tab, so with several
+Ptyxis windows the window is [chosen](#which-window-is-chosen) as for a
+terminal the daemon does not know. If Ptyxis cannot be asked, the log says why
+and the daemon steps to the tab as above. Asking for a tab was tried on Ptyxis
+50 with an ID obtained in another way; a Ptyxis that sets `PTYXIS_TAB` was not
+tried.
 
 **The JetBrains plugin** is built by `./install.sh` against each IDE it finds
 (running, or installed through Toolbox, in `/opt` or as a snap), and is loaded

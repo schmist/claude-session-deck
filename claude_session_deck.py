@@ -1787,7 +1787,157 @@ class JetBrains(Tool):
         return title or None
 
 
-TOOLS = [JetBrains()]
+
+class Ptyxis(Tool):
+    """Ptyxis, the terminal of GNOME.
+
+    A Ptyxis that tells a tab's shell the ID of its tab, in PTYXIS_TAB, is asked
+    for that tab. Up to version 50 it does not, and the tab is reached through
+    what Ptyxis tells screen readers. That names the tabs of a window by their
+    titles, which need not differ, and lets one step from a tab to the next, but
+    not pick one. So the session's tab is found by a title written to its
+    terminal, which is then set back, and stepped to."""
+
+    name = "Ptyxis"
+    WAIT = 1  # seconds for the title to show up, and for a step to take effect
+    direct_error = None  # why the tab could last not be asked for
+
+    def runs(self, pid):
+        try:
+            return read_proc(pid, "comm").strip() == "ptyxis-agent"  # the process every tab's shell is started by
+        except OSError:
+            return False
+
+    def focus(self, pid, chain):
+        if chain.index(pid) == 0:
+            raise RuntimeError("the session's terminal is not known")
+        shell = chain[chain.index(pid) - 1]  # what the tab runs
+        tab = self._tab(shell)
+        if tab:
+            try:
+                self._select(tab)
+                error = None
+            except Exception as e:
+                error = str(e) or type(e).__name__
+            if error != self.direct_error:
+                self.direct_error = error
+                if error:
+                    log(f"{self.name}: cannot ask for a tab, so it is stepped to: {error}")
+            if not error:
+                return None  # which window holds the tab is not told
+        return self._step(pid, shell)
+
+    def _tab(self, shell):
+        """ID of the tab that runs the process `shell`, None if Ptyxis did not tell it."""
+        try:
+            env = read_proc(shell, "environ").split("\0")
+        except OSError:
+            return None
+        tab = next((v.partition("=")[2] for v in env if v.startswith("PTYXIS_TAB=")), "")
+        return tab if re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", tab) else None
+
+    def _select(self, tab):
+        """Ask Ptyxis for the tab with this ID. One that has no such tab does nothing, so each one is asked."""
+        from gi.repository import Gio, GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+
+        def call(name, path, interface, method, params=None):
+            return bus.call_sync(name, path, interface, method, params, None, Gio.DBusCallFlags.NONE, 2000, None)
+
+        names = call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames").unpack()[0]
+        asked, error = 0, RuntimeError("it is not on the session bus")
+        for name in names:
+            if not re.search(r"\.Ptyxis(\.Devel)?$", name):
+                continue
+            try:
+                call(name, "/" + name.replace(".", "/").replace("-", "_"), "org.gtk.Actions", "Activate",
+                     GLib.Variant("(sava{sv})", ("focus-tab-by-uuid", [GLib.Variant("s", tab)], {})))
+                asked += 1
+            except GLib.Error as e:
+                error = e
+        if not asked:
+            raise error
+
+    def _step(self, pid, shell):
+        """Step to the tab that runs the process `shell`; returns the title of its window."""
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi
+        self.atspi = Atspi
+        terminal = os.readlink(f"/proc/{shell}/fd/0")
+        if not terminal.startswith("/dev/pts/"):
+            raise RuntimeError("the session's terminal is not known")
+        windows = self._windows((proc_stat(pid) or (0,))[0])
+        before = [[page.get_name() for page in self._pages(window)] for window in windows]
+        mark = "claude-session-deck-" + os.urandom(4).hex()
+        self._title(terminal, mark)
+        place, deadline = None, time.monotonic() + self.WAIT
+        while place is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+            place = next(((n, i, page.get_name()) for n, window in enumerate(windows)
+                          for i, page in enumerate(self._pages(window)) if page.get_name().startswith(mark)), None)
+        if place is None:
+            self._title(terminal, "")
+            raise RuntimeError("no tab took the title written to the session's terminal")
+        n, index, name = place
+        # After the title a tab names what runs in it; that part is not the title's.
+        was, rest = (before[n][index] if index < len(before[n]) else ""), name[len(mark):]
+        self._title(terminal, was[:len(was) - len(rest)] if rest and was.endswith(rest) else was)
+        # All steps are taken at once, faster than the window is drawn, so the tabs in between do not show.
+        deadline = time.monotonic() + self.WAIT
+        while time.monotonic() < deadline:
+            shown = self._shown(windows[n])
+            if shown in (None, index):
+                break
+            self._do(windows[n], "page.next" if index > shown else "page.previous", abs(index - shown))
+            time.sleep(0.05)  # until the window tells which tab it shows now
+        return windows[n].get_name() or None
+
+    def _title(self, terminal, title):
+        with open(terminal, "w") as out:
+            out.write(f"\033]0;{title}\007")
+
+    def _walk(self, node):
+        yield node
+        for i in range(node.get_child_count()):
+            child = node.get_child_at_index(i)
+            if child:
+                yield from self._walk(child)
+
+    def _windows(self, pid):
+        desktop = self.atspi.get_desktop(0)
+        for i in range(desktop.get_child_count()):
+            app = desktop.get_child_at_index(i)
+            if app and app.get_process_id() == pid:
+                return [app.get_child_at_index(n) for n in range(app.get_child_count())]
+        raise RuntimeError("it tells screen readers nothing")
+
+    def _pages(self, window):
+        """What the tabs of a window show, in the tabs' order: panels that are named as their tabs are."""
+        for node in self._walk(window):
+            children = [node.get_child_at_index(i) for i in range(node.get_child_count())]
+            pages = [c for c in children if c and c.get_role() == self.atspi.Role.PANEL and c.get_name()]
+            if any(self._holds_terminal(page) for page in pages):
+                return pages
+        return []
+
+    def _holds_terminal(self, page):
+        return any(node.get_role() == self.atspi.Role.TERMINAL for node in self._walk(page))
+
+    def _shown(self, window):
+        """Index of the tab that is selected: only its page holds a terminal."""
+        return next((i for i, page in enumerate(self._pages(window)) if self._holds_terminal(page)), None)
+
+    def _do(self, window, action, times=1):
+        for i in range(self.atspi.Action.get_n_actions(window)):
+            if self.atspi.Action.get_action_name(window, i) == action:
+                for _ in range(times):
+                    self.atspi.Action.do_action(window, i)
+                return
+        raise RuntimeError(f"its windows cannot do {action}")
+
+
+TOOLS = [JetBrains(), Ptyxis()]
 
 
 def session_tool(chain):
