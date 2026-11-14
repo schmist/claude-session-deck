@@ -1061,7 +1061,11 @@ _usage = (None, None)  # (mtime of STATUS_FILE, its rate limits)
 
 
 def account_usage():
-    """The account's usage windows as [(name, used fraction, seconds to reset)]."""
+    """The account's usage windows as [(name, used fraction, seconds to reset)].
+
+    Only what is known to hold now: a reading saved before the computer started
+    says nothing about what the account has used since, and neither does the
+    figure of a window that has reset."""
     global _usage
     try:
         mtime = os.stat(STATUS_FILE).st_mtime
@@ -1069,15 +1073,15 @@ def account_usage():
             _usage = (mtime, read_json(STATUS_FILE).get("rate_limits") or {})
     except (OSError, ValueError):
         return []
+    now = time.time()
+    if mtime < now - time.clock_gettime(time.CLOCK_BOOTTIME):
+        return []
     windows = []
     for name, field in (("5h", "five_hour"), ("week", "seven_day")):
         window = _usage[1].get(field)
-        if not window:
-            continue
-        left = (window.get("resets_at") or 0) - time.time()
-        # Once a window has reset, the last reported figure no longer applies.
-        used = (window.get("used_percentage") or 0) / 100 if left > 0 else 0.0
-        windows.append((name, used, max(0, left)))
+        left = (window.get("resets_at") or 0) - now if window else 0
+        if left > 0:
+            windows.append((name, (window.get("used_percentage") or 0) / 100, left))
     return windows
 
 

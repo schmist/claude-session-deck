@@ -88,8 +88,10 @@ usage there and has all its keys for sessions.
 **The usage key** (bottom right) shows the account's 5-hour and weekly usage
 limits: percentage used, a bar and the time until reset. It turns amber above
 65% and red above 85%. The figures come from Claude Code, so they only update
-while a session is active; for accounts without such limits the key reads
-`no data yet`.
+while a session is active. Until a session has replied since the computer
+started the key reads `no data yet`, as it does for accounts without such
+limits; a limit whose window has reset is left out until a session reports it
+again.
 
 ### Moving a session
 
@@ -592,6 +594,6 @@ journalctl --user -u claude-session-deck -f     # log
 | Pressing a key does nothing, log shows both extensions as `not loaded` | Install Window Calls, or log out and in and run `gnome-extensions enable claude-session-deck-windows@local` |
 | Log shows `no window found for …` | The line lists each mechanism tried; none applies to your desktop, or no window matches the session |
 | The wrong terminal tab stays selected in a JetBrains IDE | The plugin is not loaded: run `./install.sh`, then restart the IDE. If the log shows `JetBrains IDE: cannot focus …`, see the IDE's own log (Help → Show Log) |
-| Usage key reads `no data yet` | The status line command is not set up (run `./install.sh` again), no session has been active since, or the account has no usage limits |
+| Usage key reads `no data yet` | The status line command is not set up (run `./install.sh` again), no session has replied since the computer started, or the account has no usage limits |
 | A session is missing | It is not interactive, it uses another `CLAUDE_CONFIG_DIR`, or it runs where no [source](#how-sessions-are-found-and-read) looks: a container whose process is not yours, a kind of sandbox the daemon does not know, another machine. The deck may also have fewer keys than there are sessions |
 | Log shows `cannot load plugin …` or `…: cannot look for sessions: …` | A [plugin](#extending) failed; the line says why |
