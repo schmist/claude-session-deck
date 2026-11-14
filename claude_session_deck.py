@@ -46,7 +46,7 @@ LOCK_EVERY = 16             # seconds between mascot appearances while the scree
 LOCK_SECONDS = 12           # how long it stays then
 HOLD_SECONDS = 0.6          # how long a key is held to pick its session up, to put it on another key
 MOVE_SECONDS = 10           # how long a session that was picked up waits for its new key
-MODEL_EVERY, MODEL_SECONDS = 9, 3  # the model replaces the session's name for 3 s every 9 s
+NAME_EVERY = 9              # seconds between the scrolls of a name too long for its key
 FONT = "/usr/share/fonts/truetype/ubuntu/Ubuntu[wdth,wght].ttf"
 FALLBACK_FONT = "sans:bold"  # fontconfig pattern, used if FONT is missing
 
@@ -797,14 +797,13 @@ SCROLL_FPS = 6  # frames per second while only names scroll
 def name_scroll(name, t, size=UNIT):
     """(pixels a name too wide for a key of `size` is moved left at time `t`, whether it is moving).
 
-    Each time the name appears it rests for a second, moves until its end shows and rests there."""
+    Every NAME_EVERY seconds the name rests for a second, moves until its end shows and rests there."""
     px = scaler(size)
     over = font(px(NAME_SIZE)).getlength(name) - name_width(size)
     if over <= 0:
         return 0, False
-    shown = MODEL_EVERY - MODEL_SECONDS            # seconds the name is shown for
-    moves = min(over / px(16), shown - 2)          # at 16 px a second, faster if that takes too long
-    done = (t % MODEL_EVERY - 1) / moves
+    moves = min(over / px(16), NAME_EVERY - 3)     # at 16 px a second, faster if that takes too long
+    done = (t % NAME_EVERY - 1) / moves
     return round(over * min(1, max(0, done))), 0 < done < 1
 
 
@@ -957,26 +956,23 @@ def render_locked(model, t):
 def render(info, t, size=UNIT):
     """Image of `size` pixels for a session's key; `t` (seconds) drives the animations."""
     state = info["state"]
-    # Now and then the model takes the place of the session's name, on all keys at once.
-    show_model = bool(info["model"]) and t % MODEL_EVERY >= MODEL_EVERY - MODEL_SECONDS
-    name_font = font(scaler(size)(NAME_SIZE))
-    name = fit(info["model"], name_font, name_width(size)) if show_model else info["name"]
+    name = info["name"]
     shift = name_scroll(name, t, size)[0]
     if state not in ANIMATED:  # then only these make one image differ from the next
         drawn = (tuple(info.items()), name, shift, size)
         if drawn not in _still:
             if len(_still) > STILL_KEYS:
                 _still.clear()
-            _still[drawn] = draw_key(info, t, show_model, name, shift, size)
+            _still[drawn] = draw_key(info, t, name, shift, size)
         return _still[drawn]
-    return draw_key(info, t, show_model, name, shift, size)
+    return draw_key(info, t, name, shift, size)
 
 
 _still = {}  # what a key without animation was drawn from -> its image
 STILL_KEYS = 200  # how many of these are kept
 
 
-def draw_key(info, t, show_model, name, shift, size):
+def draw_key(info, t, name, shift, size):
     px = scaler(size)
     state = info["state"]
     accent = ACCENT.get(state, ACCENT["idle"])
@@ -1034,8 +1030,6 @@ def draw_key(info, t, show_model, name, shift, size):
     dim = (150, 156, 168) if state != "idle" else (110, 116, 128)
     soft = mix(accent, (255, 255, 255), 0.25)
     color = (255, 255, 255) if state != "idle" else (190, 195, 205)
-    if show_model:  # tinted, to tell it from the name
-        color = mix(accent, color, 0.35)
     # The name is drawn on its own strip, which cuts off what is scrolled out of it.
     box = (px(PAD), 0, px(PAD) + name_width(size), px(name_bottom + 4))
     strip = img.crop(box)
@@ -1050,9 +1044,11 @@ def draw_key(info, t, show_model, name, shift, size):
     time_x = PAD + round(MASCOT_COLS * ICON_PX) + 3
     d.text((px(time_x), px(time_y)), info["elapsed"], font=big_font,
            fill=mix(accent, (255, 255, 255), 0.3), anchor="lm")
-    if info["activity"]:
+    # Under the name: what the session is doing or waiting for, else its model.
+    under, fill = (info["activity"], soft) if info["activity"] or state == "busy" else (info["model"], dim)
+    if under:
         line = font(px(11), "Condensed Medium")
-        d.text((px(PAD), px(name_bottom + 1)), fit(info["activity"], line, name_width(size)), font=line, fill=soft)
+        d.text((px(PAD), px(name_bottom + 1)), fit(under, line, name_width(size)), font=line, fill=fill)
     d.text((size - px(PAD), px(bar_y)), info["tokens"], font=small, fill=dim, anchor="rm")
     return img
 

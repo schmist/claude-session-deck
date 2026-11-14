@@ -23,18 +23,18 @@ SS = csd.SS       # the deck is drawn supersampled like the keys, which are past
 KEY_RADIUS = 9    # corners of a key's window
 BODY_RADIUS = 40
 MARGIN = 34       # around the deck, for its shadow
-T = 3.0           # moment shown: names are up, and one creature is on stage
+T = 3.0           # moment shown: one creature is on stage
 
-# name, state, line under the name, tokens, time in the state, mascot offset
+# name, state, what it does or waits for, tokens, time in the state, mascot offset, model
 SESSIONS = [
-    ("web-shop", "busy", "Bash", 156_000, "2m", 10),
-    ("gateway", "waiting", "permission", 56_000, "41s", 0),
-    ("docs", "done", "", 88_000, "12s", 0),
-    ("infra-live", "idle", "", 720_000, "3h05", 0),
-    ("mobile", "busy", "", 231_000, "6m", 0.6),
-    ("billing", "busy", "Edit", 412_000, "58s", 12),
-    ("pipeline", "busy", "thinking", 874_000, "14m", 15),
-    ("auth", "idle", "", 31_000, "26m", 0),
+    ("web-shop", "busy", "Bash", 156_000, "2m", 10, "Opus 5.5"),
+    ("gateway", "waiting", "permission", 56_000, "41s", 0, "Sonnet 5.5"),
+    ("docs", "done", "", 88_000, "12s", 0, "Sonnet 5.5"),
+    ("infra-live", "idle", "", 720_000, "3h05", 0, "Opus 5.5"),
+    ("mobile", "busy", "", 231_000, "6m", 0.6, "Haiku 5.5"),
+    ("billing", "busy", "Edit", 412_000, "58s", 12, "Opus 5.5"),
+    ("pipeline", "busy", "thinking", 874_000, "14m", 15, "Fable 5.2"),
+    ("auth", "idle", "", 31_000, "26m", 0, "Haiku 5.5"),
 ]
 USAGE = [("5h", 0.42, 2 * 3600 + 13 * 60), ("week", 0.18, 4 * 86400)]
 
@@ -42,11 +42,11 @@ USAGE = [("5h", 0.42, 2 * 3600 + 13 * 60), ("week", 0.18, 4 * 86400)]
 def key_images():
     csd.account_usage = lambda: USAGE
     images = [csd.blank(SIZE)] * MODEL.keys
-    for key, (name, state, activity, tokens, elapsed, offset) in enumerate(SESSIONS):
+    for key, (name, state, activity, tokens, elapsed, offset, model) in enumerate(SESSIONS):
         images[key] = csd.render({
             "name": name, "state": state, "activity": activity, "elapsed": elapsed,
             "tokens": csd.fmt_tokens(tokens), "context": tokens / csd.CONTEXT_WINDOW,
-            "model": "", "offset": offset}, T)
+            "model": model, "offset": offset}, T)
     images[-1] = csd.render_usage()
     return images
 

@@ -66,11 +66,10 @@ It does not:
 | Part | Meaning |
 |---|---|
 | Top bar and colour | Session state (see below) |
-| Name | Project folder, or the session name if you renamed it; a name too long for the key scrolls to its end each time it appears |
-| Line under the name | While working: the running tool (`Bash`, `Edit`, …) or `thinking`. While waiting: the reason |
+| Name | Project folder, or the session name if you renamed it; a name too long for the key scrolls to its end every 9 s |
+| Line under the name | While working: the running tool (`Bash`, `Edit`, …) or `thinking`. While waiting: the reason. Otherwise the session's model, e.g. `Opus 5.5`, in grey |
 | Bar and number | Context used, in tokens, on a 1M scale; amber above 65%, red above 85% |
 | Creature and time | How long the session has been in its current state |
-| Model in the name's place, e.g. `Opus 5.5` | The session's model. It replaces the name, in a tinted colour, for 3 s every 9 s, on all keys at once |
 
 | State | Colour | Animation |
 |---|---|---|
@@ -570,7 +569,7 @@ The settings are constants at the top of `claude_session_deck.py`; change them a
 | `HOLD_SECONDS` | `0.6` | How long a key is held to pick its session up |
 | `MOVE_SECONDS` | `10` | How long a session that was picked up waits for its new key |
 | `LOCK_EVERY`, `LOCK_SECONDS` | `16`, `12` | While the screen is locked, the creature appears every 16 s for 12 s |
-| `MODEL_EVERY`, `MODEL_SECONDS` | `9`, `3` | The model replaces the name for 3 s every 9 s |
+| `NAME_EVERY` | `9` | Seconds between the scrolls of a name too long for its key |
 | `MASCOT_ANIMATIONS` | walk 35, think 25, peek 20, wave 20 | Relative probability of each animation |
 | `FONT` | Ubuntu variable font | Font file used for all text |
 
