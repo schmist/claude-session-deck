@@ -31,7 +31,6 @@ from PIL import Image, ImageDraw, ImageFont
 CLAUDE_DIR = os.path.expanduser("~/.claude")  # where Claude Code keeps its session files and transcripts
 PLUGINS_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
                            "claude-session-deck", "plugins")           # see load_plugins()
-STATUS_FILE = os.path.expanduser("~/.claude/claude-session-deck/status.json")   # written by statusline.sh
 LOGIN_FILE = os.path.join(CLAUDE_DIR, ".credentials.json")  # Claude Code's login, see ask_usage()
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 USAGE_EVERY = 60            # seconds between asking Anthropic for the account usage; 0 never asks
@@ -1058,42 +1057,20 @@ def draw_key(info, t, name, shift, size):
     return img
 
 
-_usage = (None, None)  # (mtime of STATUS_FILE, its rate limits)
-_asked = (0, {})        # (when Anthropic answered, the rate limits it gave), see ask_usage()
+_usage = []  # what Anthropic gave last: (name, used fraction, when it resets) of each usage window, see ask_usage()
 
 
 def account_usage():
     """The account's usage windows as [(name, used fraction, seconds to reset)].
 
-    From Anthropic's answer or what the status line saved, whichever is newer;
-    a limit of one model's own is in Anthropic's answer only.
-    Only what is known to hold now: a reading saved before the computer started
-    says nothing about what the account has used since, and neither does the
-    figure of a window that has reset."""
-    global _usage
-    readings = [_asked]
-    try:
-        mtime = os.stat(STATUS_FILE).st_mtime
-        if _usage[0] != mtime:
-            _usage = (mtime, read_json(STATUS_FILE).get("rate_limits") or {})
-        readings.append(_usage)
-    except (OSError, ValueError):
-        pass
-    when, limits = max(readings, key=lambda reading: reading[0])
+    Only what is known to hold now: the figure of a window that has reset says
+    nothing about what the account has used since."""
     now = time.time()
-    if when < now - time.clock_gettime(time.CLOCK_BOOTTIME):
-        return []
-    windows = []
-    for name, window in [("5h", limits.get("five_hour")), ("week", limits.get("seven_day")),
-                         *((scoped["name"], scoped) for scoped in _asked[1].get("scoped", []))]:
-        left = (window.get("resets_at") or 0) - now if window else 0
-        if left > 0:
-            windows.append((name, (window.get("used_percentage") or 0) / 100, left))
-    return windows
+    return [(name, used, resets - now) for name, used, resets in _usage if resets > now]
 
 
 def fetch_usage():
-    """The account's rate limits as Anthropic gives them now, in the form of the status line's.
+    """The account's usage windows as Anthropic gives them now, in the form of _usage.
 
     None without a login that is valid now. The login is Claude Code's and only
     read: renewing it is left to Claude Code, which would lose it otherwise."""
@@ -1107,27 +1084,21 @@ def fetch_usage():
         "Authorization": "Bearer " + login["accessToken"], "User-Agent": "claude-session-deck"})
     with urllib.request.urlopen(request, timeout=10) as response:
         answer = json.load(response)
-    def window(used, resets_at, **more):
-        return {"used_percentage": used or 0, "resets_at": datetime.datetime.fromisoformat(resets_at).timestamp(),
-                **more}
-
-    limits = {"scoped": []}  # the limits of one model's own, such as a week's Fable
-    for field in ("five_hour", "seven_day"):
-        given = answer.get(field)
-        if given and given.get("resets_at"):
-            limits[field] = window(given.get("utilization"), given["resets_at"])
-    for given in answer.get("limits") or []:
-        name = ((given.get("scope") or {}).get("model") or {}).get("display_name")
-        if name and given.get("resets_at"):
-            limits["scoped"].append(window(given.get("percent"), given["resets_at"], name=name.lower()))
-    return limits
+    given = [(name, answer.get(field) or {}, "utilization")
+             for name, field in (("5h", "five_hour"), ("week", "seven_day"))]
+    for limit in answer.get("limits") or []:  # the limits of one model's own, such as a week's Fable
+        model = ((limit.get("scope") or {}).get("model") or {}).get("display_name")
+        if model:
+            given.append((model.lower(), limit, "percent"))
+    return [(name, (window.get(used) or 0) / 100, datetime.datetime.fromisoformat(window["resets_at"]).timestamp())
+            for name, window, used in given if window.get("resets_at")]
 
 
 def ask_usage():
     """Keep asking Anthropic for the account usage; meant to run in a thread of its own.
 
-    So the usage shows whatever status line a session has, and before any replied."""
-    global _asked
+    While Anthropic does not answer, what it gave last stays."""
+    global _usage
     wait, failed = USAGE_EVERY, None
     while True:
         try:
@@ -1135,7 +1106,7 @@ def ask_usage():
         except Exception as e:  # no network, or Anthropic refuses
             limits, error = None, str(e)
         if limits is not None:
-            _asked = (time.time(), limits)
+            _usage = limits
         if error != failed:
             failed = error
             log(f"cannot ask Anthropic for the usage: {error}" if error else "Anthropic gives the usage again")

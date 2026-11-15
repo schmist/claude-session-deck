@@ -193,60 +193,9 @@ if is_gnome; then
     fi
 fi
 
-# --- account usage: Claude Code status line ----------------------------------
-# statusline.sh saves the usage limits Claude Code passes to its status line command.
-hook_dir="$HOME/.claude/claude-session-deck"
-install -Dm755 "$here/statusline.sh" "$hook_dir/statusline.sh"
-# status_line_setup check|apply: prints configured, add, replace or unreadable
-status_line_setup() {
-    "$python" - "$HOME/.claude/settings.json" "$hook_dir" "$1" <<'PY'
-import json, os, sys
-path, hook_dir, mode = sys.argv[1:4]
-ours = "~/.claude/claude-session-deck/statusline.sh"
-try:
-    settings = json.load(open(path))
-except FileNotFoundError:
-    settings = {}
-except ValueError:
-    print("unreadable"); sys.exit()
-current = (settings.get("statusLine") or {}).get("command")
-if current == ours:
-    print("configured"); sys.exit()
-if mode == "check":
-    print("replace" if current else "add"); sys.exit()
-if os.path.exists(path):
-    with open(os.path.join(hook_dir, "settings.json.before-claude-session-deck"), "w") as backup:
-        backup.write(open(path).read())
-original = os.path.join(hook_dir, "statusline-original")
-if current:  # keep the existing status line working behind ours
-    with open(original, "w") as out:
-        out.write(current)
-elif os.path.exists(original):  # left by an earlier installation
-    os.remove(original)
-settings["statusLine"] = {**(settings.get("statusLine") or {}), "type": "command", "command": ours}
-os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path + ".tmp", "w") as out:
-    json.dump(settings, out, indent=2)
-    out.write("\n")
-os.replace(path + ".tmp", path)
-print("configured")
-PY
-}
-
-status_line=$(status_line_setup check)
-case "$status_line" in
-    add)     question="Show account usage on the bottom-right key? This adds a status line command to ~/.claude/settings.json" ;;
-    replace) question="Show account usage on the bottom-right key? This wraps your existing Claude Code status line command in ~/.claude/settings.json" ;;
-    *)       question="" ;;
-esac
-if [ -n "$question" ] && ask "$question"; then
-    status_line=$(status_line_setup apply)
-fi
-case "$status_line" in
-    configured) : ;;
-    unreadable) warn "~/.claude/settings.json is not valid JSON; the usage key will show 'no data yet'" ;;
-    *)          warn "status line not configured; the usage key will show 'no data yet'" ;;
-esac
+# --- the status line command of earlier versions -----------------------------
+# The usage came from a status line command once; Claude Code gets its previous one back.
+"$here/restore-status-line.sh"
 
 # --- JetBrains IDEs: select the session's terminal tab ------------------------
 # The plugin is built against each IDE found, by Gradle running on the Java that IDE ships.

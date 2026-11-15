@@ -13,36 +13,7 @@ rm -rf "$HOME/.local/share/gnome-shell/extensions/$ext_uuid"
 rm -rf "$HOME/.local/share/claude-session-deck" "$HOME/.cache/claude-session-deck"
 rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}"/{JetBrains,Google}/*/claude-session-deck  # IDE plugins
 
-# Give Claude Code its previous status line back. The folder with the status
-# line command stays if that fails, as the settings may still refer to it.
-if python3 - "$HOME/.claude/settings.json" "$HOME/.claude/claude-session-deck" <<'PY'
-import json, os, sys
-path, hook_dir = sys.argv[1:3]
-try:
-    settings = json.load(open(path))
-except FileNotFoundError:
-    sys.exit()
-if (settings.get("statusLine") or {}).get("command") != "~/.claude/claude-session-deck/statusline.sh":
-    sys.exit()
-try:
-    original = open(os.path.join(hook_dir, "statusline-original")).read().strip()
-except OSError:
-    original = ""
-if original:
-    settings["statusLine"]["command"] = original
-else:
-    del settings["statusLine"]
-with open(path + ".tmp", "w") as out:
-    json.dump(settings, out, indent=2)
-    out.write("\n")
-os.replace(path + ".tmp", path)
-PY
-then
-    rm -rf "$HOME/.claude/claude-session-deck"
-else
-    echo "warning: could not read or change ~/.claude/settings.json; if its statusLine runs" >&2
-    echo "  ~/.claude/claude-session-deck/statusline.sh, change that, then delete that folder." >&2
-fi
+"$(dirname "$(readlink -f "$0")")/restore-status-line.sh"
 
 echo "claude-session-deck removed."
 if gnome-extensions list 2>/dev/null | grep -qx "window-calls@domandoman.xyz"; then
