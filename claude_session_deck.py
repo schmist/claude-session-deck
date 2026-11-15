@@ -1085,11 +1085,11 @@ def fetch_usage():
     with urllib.request.urlopen(request, timeout=10) as response:
         answer = json.load(response)
     given = [(name, answer.get(field) or {}, "utilization")
-             for name, field in (("5h", "five_hour"), ("week", "seven_day"))]
+             for name, field in (("5h", "five_hour"), ("Week", "seven_day"))]
     for limit in answer.get("limits") or []:  # the limits of one model's own, such as a week's Fable
         model = ((limit.get("scope") or {}).get("model") or {}).get("display_name")
         if model:
-            given.append((model.lower(), limit, "percent"))
+            given.append((model, limit, "percent"))
     return [(name, (window.get(used) or 0) / 100, datetime.datetime.fromisoformat(window["resets_at"]).timestamp())
             for name, window, used in given if window.get("resets_at")]
 

@@ -36,7 +36,7 @@ SESSIONS = [
     ("pipeline", "busy", "thinking", 874_000, "14m", 15, "Fable 5.2"),
     ("auth", "idle", "", 31_000, "26m", 0, "Haiku 5.5"),
 ]
-USAGE = [("5h", 0.42, 2 * 3600 + 13 * 60), ("week", 0.18, 4 * 86400)]
+USAGE = [("5h", 0.42, 2 * 3600 + 13 * 60), ("Week", 0.18, 4 * 86400)]
 
 
 def key_images():
