@@ -1065,7 +1065,8 @@ _asked = (0, {})        # (when Anthropic answered, the rate limits it gave), se
 def account_usage():
     """The account's usage windows as [(name, used fraction, seconds to reset)].
 
-    From Anthropic's answer or what the status line saved, whichever is newer.
+    From Anthropic's answer or what the status line saved, whichever is newer;
+    a limit of one model's own is in Anthropic's answer only.
     Only what is known to hold now: a reading saved before the computer started
     says nothing about what the account has used since, and neither does the
     figure of a window that has reset."""
@@ -1083,8 +1084,8 @@ def account_usage():
     if when < now - time.clock_gettime(time.CLOCK_BOOTTIME):
         return []
     windows = []
-    for name, field in (("5h", "five_hour"), ("week", "seven_day")):
-        window = limits.get(field)
+    for name, window in [("5h", limits.get("five_hour")), ("week", limits.get("seven_day")),
+                         *((scoped["name"], scoped) for scoped in _asked[1].get("scoped", []))]:
         left = (window.get("resets_at") or 0) - now if window else 0
         if left > 0:
             windows.append((name, (window.get("used_percentage") or 0) / 100, left))
@@ -1106,12 +1107,19 @@ def fetch_usage():
         "Authorization": "Bearer " + login["accessToken"], "User-Agent": "claude-session-deck"})
     with urllib.request.urlopen(request, timeout=10) as response:
         answer = json.load(response)
-    limits = {}
+    def window(used, resets_at, **more):
+        return {"used_percentage": used or 0, "resets_at": datetime.datetime.fromisoformat(resets_at).timestamp(),
+                **more}
+
+    limits = {"scoped": []}  # the limits of one model's own, such as a week's Fable
     for field in ("five_hour", "seven_day"):
-        window = answer.get(field)
-        if window and window.get("resets_at"):
-            limits[field] = {"used_percentage": window.get("utilization") or 0,
-                             "resets_at": datetime.datetime.fromisoformat(window["resets_at"]).timestamp()}
+        given = answer.get(field)
+        if given and given.get("resets_at"):
+            limits[field] = window(given.get("utilization"), given["resets_at"])
+    for given in answer.get("limits") or []:
+        name = ((given.get("scope") or {}).get("model") or {}).get("display_name")
+        if name and given.get("resets_at"):
+            limits["scoped"].append(window(given.get("percent"), given["resets_at"], name=name.lower()))
     return limits
 
 
@@ -1150,25 +1158,27 @@ def render_usage(size=UNIT):
     img = background(accent, 0.14)
     g = ImageDraw.Draw(img)
     g.rectangle((0, 0, big, 3 * SS), fill=mix(BASE, accent, 0.7))
-    rows = [7 + i * 27 for i in range(len(windows))]  # top of each window's block
+    # Top of each window's block, then its text's baseline, its bar and its font sizes: three are closer together.
+    rows = [4 + i * 19 if len(windows) > 2 else 7 + i * 27 for i in range(len(windows))]
+    base, bar, sizes = (11, (13, 17), (10, 9, 13)) if len(windows) > 2 else (13, (16, 21), (11, 10, 15))
     for y, (_, used, _) in zip(rows, windows):
-        box = (PAD * SS, (y + 16) * SS, (UNIT - PAD) * SS, (y + 21) * SS)
+        box = (PAD * SS, (y + bar[0]) * SS, (UNIT - PAD) * SS, (y + bar[1]) * SS)
         g.rounded_rectangle(box, 2.5 * SS, fill=TRACK)
         g.rounded_rectangle((box[0], box[1], box[0] + max(5 * SS, (box[2] - box[0]) * min(1, used)),
                              box[3]), 2.5 * SS, fill=level_color(used, MASCOT_COLOR))
     img = img.resize((size, size), Image.LANCZOS)
     d = ImageDraw.Draw(img)
     dim = (150, 156, 168)
-    small = font(px(10), "Condensed Medium")
+    small = font(px(sizes[1]), "Condensed Medium")
     if not windows:
         d.text((size / 2, px(24)), "usage", font=font(px(15)), fill=(255, 255, 255), anchor="mm")
         d.text((size / 2, px(42)), "no data yet", font=small, fill=dim, anchor="mm")
         return img
     for y, (name, used, left) in zip(rows, windows):
-        d.text((px(PAD), px(y + 13)), name, font=font(px(11)), fill=(255, 255, 255), anchor="ls")
-        x = px(PAD) + font(px(11)).getlength(name) + px(3)
-        d.text((x, px(y + 13)), fmt_reset(left), font=small, fill=dim, anchor="ls")
-        d.text((size - px(PAD), px(y + 13)), f"{round(used * 100)}%", font=font(px(15)),
+        d.text((px(PAD), px(y + base)), name, font=font(px(sizes[0])), fill=(255, 255, 255), anchor="ls")
+        x = px(PAD) + font(px(sizes[0])).getlength(name) + px(3)
+        d.text((x, px(y + base)), fmt_reset(left), font=small, fill=dim, anchor="ls")
+        d.text((size - px(PAD), px(y + base)), f"{round(used * 100)}%", font=font(px(sizes[2])),
                fill=(255, 255, 255), anchor="rs")
     return img
 
@@ -1237,16 +1247,19 @@ def draw_panels(size, counts, windows):
         if not windows:
             texts.append(((x + pw / 2, 40), "usage", font(22), white, "mm"))
             texts.append(((x + pw / 2, 64), "no data yet", font(15, "Condensed Medium"), dim, "mm"))
+        # Three windows are closer together: the rows' distance, the text's baseline, the bar and the font sizes.
+        top, pitch, base, bar, sizes = (h * 0.05, h * 0.3, 16, (20, 25), (15, 13, 18)) if len(windows) > 2 \
+            else (14, 40, 18, (24, 31), (17, 15, 22))
         for row, (name, used, left) in enumerate(windows):
-            y = 14 + row * 40
-            box = ((x + 12) * SS, (y + 24) * SS, (x + pw - 12) * SS, (y + 31) * SS)
-            g.rounded_rectangle(box, 3.5 * SS, fill=TRACK)
+            y = top + row * pitch
+            box = ((x + 12) * SS, (y + bar[0]) * SS, (x + pw - 12) * SS, (y + bar[1]) * SS)
+            g.rounded_rectangle(box, (bar[1] - bar[0]) / 2 * SS, fill=TRACK)
             g.rounded_rectangle((box[0], box[1], box[0] + max(7 * SS, (box[2] - box[0]) * min(1, used)),
-                                 box[3]), 3.5 * SS, fill=level_color(used, MASCOT_COLOR))
-            texts.append(((x + 12, y + 18), name, font(17), white, "ls"))
-            texts.append(((x + 12 + font(17).getlength(name) + 5, y + 18), fmt_reset(left),
-                          font(15, "Condensed Medium"), dim, "ls"))
-            texts.append(((x + pw - 12, y + 18), f"{round(used * 100)}%", font(22), white, "rs"))
+                                 box[3]), (bar[1] - bar[0]) / 2 * SS, fill=level_color(used, MASCOT_COLOR))
+            texts.append(((x + 12, y + base), name, font(sizes[0]), white, "ls"))
+            texts.append(((x + 12 + font(sizes[0]).getlength(name) + 5, y + base), fmt_reset(left),
+                          font(sizes[1], "Condensed Medium"), dim, "ls"))
+            texts.append(((x + pw - 12, y + base), f"{round(used * 100)}%", font(sizes[2]), white, "rs"))
         return texts
 
     return draw_screen(size, graphics)
@@ -1271,9 +1284,10 @@ def draw_compact(size, counts, windows):
         if not windows:
             texts.append((((left_edge + right_edge) / 2, h / 2), "no usage data",
                           font(11, "Condensed Medium"), dim, "mm"))
+        rows = max(2, len(windows))
         for row, (name, used, _) in enumerate(windows):
-            y = 5 + row * (h - 6) // 2
-            box = (left_edge * SS, (y + 14) * SS, right_edge * SS, (y + 18) * SS)
+            y = (5 if rows == 2 else 0) + row * (h - 6) // rows
+            box = (left_edge * SS, (y + 14) * SS, right_edge * SS, (y + (18 if rows == 2 else 17)) * SS)
             g.rounded_rectangle(box, 2 * SS, fill=TRACK)
             g.rounded_rectangle((box[0], box[1], box[0] + max(4 * SS, (box[2] - box[0]) * min(1, used)),
                                  box[3]), 2 * SS, fill=level_color(used, MASCOT_COLOR))

@@ -86,7 +86,8 @@ with a [screen next to its keys](#screens-dials-and-touch-keys) shows the
 usage there and has all its keys for sessions.
 
 **The usage key** (bottom right) shows the account's 5-hour and weekly usage
-limits: percentage used, a bar and the time until reset. It turns amber above
+limits, and the weekly limit of a model that has one of its own, such as
+Fable: percentage used, a bar and the time until reset. It turns amber above
 65% and red above 85%. The figures are a minute old at most. For accounts
 without such limits the key reads `no data yet`.
 
@@ -264,7 +265,7 @@ reply. The installer registers `statusline.sh` as that command; it saves the
 data for the daemon and then runs the status line you had before, if any. The
 daemon shows whichever figures are newer, so the usage follows a session that
 is working more closely than once a minute, and still shows if Anthropic does
-not answer. A reading from before the computer started is not shown, nor a
+not answer. A model's own limit is in Anthropic's answer only. A reading from before the computer started is not shown, nor a
 limit whose window has reset. The uninstaller restores the previous setting,
 and a copy of your earlier settings is kept in
 `~/.claude/claude-session-deck/settings.json.before-claude-session-deck`.
