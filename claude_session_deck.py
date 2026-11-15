@@ -196,50 +196,127 @@ class DeckBusy(OSError):
     """An emulated deck that another daemon uses."""
 
 
+# How a deck is reached differs per operating system. Each way is a Device,
+# and DEVICE names the one in use.
+
+class Device:
+    """A deck to send reports to and to read them from. A subclass describes one way to reach it.
+
+    `fd` is a file that is readable when a report has arrived. Unless
+    overridden, reports are read from and written to it as they are."""
+
+    @staticmethod
+    def find():
+        """Path -> USB product id of every deck that can be reached this way."""
+        return {}
+
+    def feature(self, report):
+        """Send a feature report."""
+        raise NotImplementedError
+
+    def write(self, report):
+        """Send an output report."""
+        write_report(self.fd, report)
+
+    def read(self):
+        """The next report that has arrived, None if there is none. An empty one tells that the deck is gone."""
+        try:
+            return os.read(self.fd, 1024)
+        except BlockingIOError:
+            return None
+
+    def close(self):
+        os.close(self.fd)
+
+
+def write_report(fd, data):
+    """Write `data` to a deck's file at once, waiting while it takes none."""
+    while True:
+        try:
+            os.write(fd, data)
+            return
+        except BlockingIOError:
+            if not select.select([], [fd], [], WRITE_TIMEOUT)[1]:
+                raise TimeoutError("it takes no data") from None
+
+
+class HidRaw(Device):
+    """A deck as Linux offers it: the file of a raw HID device."""
+
+    @staticmethod
+    def find():
+        found = {}
+        for dev in glob.glob("/sys/class/hidraw/hidraw*"):
+            try:
+                with open(dev + "/device/uevent") as f:
+                    uevent = f.read()
+            except OSError:
+                continue
+            m = re.search(r"HID_ID=\w+:(\w+):(\w+)", uevent)
+            if m and int(m[1], 16) == ELGATO_VENDOR and model_of(int(m[2], 16)):
+                found["/dev/" + os.path.basename(dev)] = int(m[2], 16)
+        return found
+
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+
+    def feature(self, report):
+        buf = bytearray(report)
+        hidiocsfeature = (3 << 30) | (len(buf) << 16) | (ord("H") << 8) | 0x06
+        fcntl.ioctl(self.fd, hidiocsfeature, buf)
+
+
+class Emulated(Device):
+    """A deck that emulator.py stands in for, reached through its socket.
+
+    It is sent the reports a real one is, each as one message that starts with
+    "O" for an output report or "F" for a feature report, and sends the reports
+    a real one does. `product` is the USB product id it tells."""
+
+    def __init__(self, path):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as conn:
+            conn.settimeout(1)
+            conn.connect(path)
+            hello = conn.recv(64)  # its USB ids, as "0fd9:0080"
+            if not hello:
+                raise DeckBusy("in use")
+            try:
+                self.product = int(hello.split(b":")[-1], 16)
+            except ValueError:
+                self.product = None
+            self.fd = conn.detach()
+        os.set_blocking(self.fd, False)
+
+    def feature(self, report):
+        write_report(self.fd, b"F" + report)
+
+    def write(self, report):
+        write_report(self.fd, b"O" + report)
+
+
+DEVICE = HidRaw
+
+
 def find_decks():
     """Path -> USB product id of every deck there is.
 
     A deck that emulator.py stands in for is a socket, and its id is None
     here: it tells its id once connected."""
-    found = {}
-    for dev in glob.glob("/sys/class/hidraw/hidraw*"):
-        try:
-            with open(dev + "/device/uevent") as f:
-                uevent = f.read()
-        except OSError:
-            continue
-        m = re.search(r"HID_ID=\w+:(\w+):(\w+)", uevent)
-        if m and int(m[1], 16) == ELGATO_VENDOR and model_of(int(m[2], 16)):
-            found["/dev/" + os.path.basename(dev)] = int(m[2], 16)
+    found = dict(DEVICE.find())
     for path in glob.glob(os.path.join(RUNTIME_DIR, "deck-*.sock")):
         found[path] = None
     return found
 
 
 class Deck:
-    """One deck, connected or emulated.
-
-    An emulated deck is sent the reports a real one is, each as one message
-    that starts with "O" for an output report or "F" for a feature report, and
-    sends the reports a real one does."""
+    """One deck, connected or emulated."""
 
     def __init__(self, path, product=None):
-        self.path, self.emulated = path, product is None
-        if self.emulated:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as conn:
-                conn.settimeout(1)
-                conn.connect(path)
-                hello = conn.recv(64)  # its USB ids, as "0fd9:0080"
-                if not hello:
-                    raise DeckBusy("in use")
-                try:
-                    product = int(hello.split(b":")[-1], 16)
-                except ValueError:
-                    product = None
-                self.fd = conn.detach()
-            os.set_blocking(self.fd, False)
-        else:
-            self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        self.path = path
+        self.device = DEVICE(path) if product is not None else Emulated(path)
+        self.fd = self.device.fd  # readable when the deck has reported something
+        if product is None:
+            product = self.device.product
         try:
             if not model_of(product):
                 raise OSError("not a model this program knows")
@@ -251,27 +328,10 @@ class Deck:
             self.slots = [None] * self.model.keys  # session shown on each key
             self.brightness = BRIGHTNESS
             self.dark = False                      # see darken()
-            self._feature(self.model.brightness(BRIGHTNESS))
+            self.device.feature(self.model.brightness(BRIGHTNESS))
         except OSError:
             self.close()
             raise
-
-    def _feature(self, report):
-        if self.emulated:
-            return self._write(report, b"F")
-        buf = bytearray(report)
-        hidiocsfeature = (3 << 30) | (len(buf) << 16) | (ord("H") << 8) | 0x06
-        fcntl.ioctl(self.fd, hidiocsfeature, buf)
-
-    def _write(self, report, kind=b"O"):
-        data = kind + report if self.emulated else report
-        while True:
-            try:
-                os.write(self.fd, data)
-                return
-            except BlockingIOError:
-                if not select.select([], [self.fd], [], WRITE_TIMEOUT)[1]:
-                    raise TimeoutError("it takes no data") from None
 
     def set_image(self, key, image):
         """Draw `image` on `key`; skipped if `image` is what is shown already."""
@@ -283,7 +343,7 @@ class Deck:
         buf = io.BytesIO()
         image.save(buf, self.model.image_format, quality=90)
         for report in self.model.image_reports(key, buf.getvalue()):
-            self._write(report)
+            self.device.write(report)
         self.shown[key] = pixels
 
     def set_screen(self, image):
@@ -300,20 +360,20 @@ class Deck:
             buf = io.BytesIO()
             piece.save(buf, "JPEG", quality=90)
             for report in model.screen_reports(buf.getvalue(), box):
-                self._write(report)
+                self.device.write(report)
             self.screen_shown[part] = pixels
 
     def dim(self, steps):
         """Make the deck brighter by `steps`, or darker if they are negative."""
         self.brightness = min(100, max(5, self.brightness + 5 * steps))
-        self._feature(self.model.brightness(self.brightness))
+        self.device.feature(self.model.brightness(self.brightness))
 
     def darken(self):
         """Show nothing and switch the light off: a deck may keep its power when the computer has none."""
         if not self.dark:
             self.dark = True
             self.clear()
-            self._feature(self.model.brightness(0))
+            self.device.feature(self.model.brightness(0))
 
     def lighten(self):
         """Take back darken(). Nothing that was shown is taken to be shown still."""
@@ -321,7 +381,7 @@ class Deck:
             self.dark = False
             self.shown = [None] * self.model.keys
             self.screen_shown = [None] * self.model.panels
-            self._feature(self.model.brightness(self.brightness))
+            self.device.feature(self.model.brightness(self.brightness))
 
     def clear(self):
         for key in range(self.model.keys):
@@ -341,9 +401,8 @@ class Deck:
         pressed; "turn" and "touch" are as Model.read() tells them."""
         events = []
         while True:
-            try:
-                report = os.read(self.fd, 1024)
-            except BlockingIOError:
+            report = self.device.read()
+            if report is None:
                 break
             if not report:
                 raise OSError("it is gone")
@@ -368,16 +427,86 @@ class Deck:
         return events
 
     def close(self):
-        os.close(self.fd)
+        self.device.close()
 
 
-# -------------------------------------------------------------- sessions ---
+# ------------------------------------------------------------- processes ---
+# What is asked about the processes on this machine. The answers are read from
+# /proc, which is Linux's: another operating system needs these functions anew.
+# What only Linux has reads /proc where it is used: Containers, Ptyxis.
 
 def read_proc(pid, name):
     """Text of /proc/<pid>/<name>."""
     with open(f"/proc/{pid}/{name}", errors="replace") as f:  # arguments need not be UTF-8
         return f.read()
 
+
+def stat_fields(text):
+    """(parent pid, terminal, start time) from the text of a /proc/<pid>/stat, None if it is not one."""
+    fields = text.rsplit(")", 1)[-1].split()
+    try:
+        return int(fields[1]), fields[4], fields[19]
+    except (IndexError, ValueError):
+        return None
+
+
+def proc_stat(pid):
+    """(parent pid, terminal, start time) of a process, None if there is none.
+
+    The terminal is "0" for a process without one, and the start time is what
+    Claude Code writes as "procStart" to the file of a session."""
+    try:
+        return stat_fields(read_proc(pid, "stat"))
+    except OSError:
+        return None
+
+
+def proc_start(pid):
+    fields = proc_stat(pid)
+    return fields and fields[2]
+
+
+def proc_pids():
+    """Pids of the processes on this machine."""
+    return [int(entry) for entry in os.listdir("/proc") if entry.isdigit()]
+
+
+def proc_name(pid):
+    """Name of the program a process runs, "" if there is no such process."""
+    try:
+        return read_proc(pid, "comm").strip()
+    except OSError:
+        return ""
+
+
+def proc_args(pid):
+    """Arguments a process was started with, the program first; [] if there is no such process."""
+    try:
+        return read_proc(pid, "cmdline").split("\0")
+    except OSError:
+        return []
+
+
+def proc_cwd(pid):
+    """Folder a process works in."""
+    return os.path.realpath(f"/proc/{pid}/cwd")
+
+
+def proc_terminal_times(pid):
+    """(last read, last written) of the terminal a process reads from, None if it reads from none."""
+    try:
+        st = os.stat(f"/proc/{pid}/fd/0")
+    except OSError:
+        return None
+    return (st.st_atime, st.st_mtime) if stat.S_ISCHR(st.st_mode) else None
+
+
+def pid_namespace():
+    """What Claude Code writes as "pidDomain" to the file of a session that runs among this machine's processes."""
+    return os.readlink("/proc/self/ns/pid")
+
+
+# -------------------------------------------------------------- sessions ---
 
 def read_json(path):
     with open(path) as f:
@@ -393,28 +522,6 @@ def save_json(path, data, what):
         os.replace(path + ".tmp", path)
     except OSError as e:
         log(f"cannot save {what}:", e)
-
-
-def stat_fields(text):
-    """(parent pid, terminal, start time) from the text of a /proc/<pid>/stat, None if it is not one."""
-    fields = text.rsplit(")", 1)[-1].split()
-    try:
-        return int(fields[1]), fields[4], fields[19]
-    except (IndexError, ValueError):
-        return None
-
-
-def proc_stat(pid):
-    """(parent pid, terminal, start time) of a process, None if there is none."""
-    try:
-        return stat_fields(read_proc(pid, "stat"))
-    except OSError:
-        return None
-
-
-def proc_start(pid):
-    fields = proc_stat(pid)
-    return fields and fields[2]
 
 
 def is_session(s, start):
@@ -467,7 +574,7 @@ class Local(Source):
         self.name = f"session files in {self.config}"
 
     def sessions(self):
-        own_ns = os.readlink("/proc/self/ns/pid")
+        own_ns = pid_namespace()
         found = {}
         for path in glob.glob(os.path.join(self.config, "sessions", "*.json")):
             try:
@@ -484,22 +591,15 @@ class Local(Source):
         return found
 
 
-CLAUDE_PIDS_INTERVAL = 2  # seconds between searches of /proc for Claude processes
-_claude_pids = (float("-inf"), [])  # (when /proc was searched, the pids found)
+CLAUDE_PIDS_INTERVAL = 2  # seconds between searches for Claude processes
+_claude_pids = (float("-inf"), [])  # (when they were searched, the pids found)
 
 
 def claude_pids():
     """Pids of the Claude processes on this host, in a container or not."""
     global _claude_pids
     if time.monotonic() - _claude_pids[0] >= CLAUDE_PIDS_INTERVAL:
-        pids = []
-        for entry in os.listdir("/proc"):
-            try:
-                if entry.isdigit() and read_proc(entry, "comm").strip() == "claude":
-                    pids.append(int(entry))
-            except OSError:
-                continue
-        _claude_pids = (time.monotonic(), pids)
+        _claude_pids = (time.monotonic(), [pid for pid in proc_pids() if proc_name(pid) == "claude"])
     return _claude_pids[1]
 
 
@@ -511,13 +611,13 @@ class Containers(Source):
     name = "containers"
 
     def sessions(self):
-        own_ns = os.readlink("/proc/self/ns/pid")
+        own_ns = pid_namespace()
         found = {}
         for pid in claude_pids():
             try:
                 parent, tty, start = proc_stat(pid) or (0, "0", "")
                 if os.readlink(f"/proc/{pid}/ns/pid") == own_ns or tty == "0" \
-                        or read_proc(parent, "comm").strip() == "claude":
+                        or proc_name(parent) == "claude":
                     continue
                 env = dict(v.split("=", 1) for v in read_proc(pid, "environ").split("\0") if "=" in v)
                 inner = env.get("CLAUDE_CONFIG_DIR") or os.path.join(env.get("HOME", "/"), ".claude")
@@ -1443,15 +1543,10 @@ def watch_sandboxes():
 
 def processes(program):
     """(pid, arguments) of each process on this host that runs `program`."""
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            args = read_proc(entry, "cmdline").split("\0")
-        except OSError:
-            continue
-        if os.path.basename(args[0]) == program:
-            yield int(entry), args
+    for pid in proc_pids():
+        args = proc_args(pid)
+        if args and os.path.basename(args[0]) == program:
+            yield pid, args
 
 
 class Sandboxes(Source):
@@ -1483,19 +1578,10 @@ SOURCES = [Local(), Containers(), Sandboxes()]
 TERMINAL_SLACK = 16  # seconds the times may differ: the kernel records them in steps of 8
 
 
-def terminal_times(path):
-    """(last read, last written) of the terminal at `path`, None if it is not one."""
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return (st.st_atime, st.st_mtime) if stat.S_ISCHR(st.st_mode) else None
-
-
 def terminal_client(program, times, likely):
     """Pid of the `program` process in a terminal through which the user works in a session.
 
-    `times` are the terminal_times() of the session's own terminal. Without a
+    `times` are the proc_terminal_times() of the session's own terminal. Without a
     process whose terminal has these, it is the latest one for which
     `likely(pid, arguments, start time)` holds."""
     exact, exact_off, guess, guess_start = None, TERMINAL_SLACK, None, -1
@@ -1504,7 +1590,7 @@ def terminal_client(program, times, likely):
         if tty == "0" or parent == os.getpid():  # gone, not in a terminal, or a probe of ours
             continue
         start = int(start)
-        own = terminal_times(f"/proc/{pid}/fd/0")
+        own = proc_terminal_times(pid)
         if times and own and len(times) == 2:
             off = abs(own[0] - times[0]) + abs(own[1] - times[1])
             if off < exact_off:
@@ -1519,7 +1605,7 @@ def sandbox_client(session):
     kind, sandbox = session["sandbox"]
     cwd = session.get("cwd", "")
     return terminal_client(kind.program, session.get("tty"), lambda pid, args, start:
-                           sandbox in args or cwd in args or os.path.realpath(f"/proc/{pid}/cwd") == cwd)
+                           sandbox in args or cwd in args or proc_cwd(pid) == cwd)
 
 
 # --------------------------------------------------------- window focus ---
@@ -1538,9 +1624,9 @@ def docker_client(session):
     born = int(proc_start(session["hostPid"]) or 0)
     # The client starts just before its container, so the latest one started
     # before the session is likely its own.
-    return terminal_client("docker", terminal_times(f"/proc/{session['hostPid']}/fd/0"), lambda pid, args, start:
+    return terminal_client("docker", proc_terminal_times(session["hostPid"]), lambda pid, args, start:
                            "run" in args and start <= born
-                           and (cwd in args or os.path.realpath(f"/proc/{pid}/cwd") == cwd))
+                           and (cwd in args or proc_cwd(pid) == cwd))
 
 
 # Focusing a window differs per desktop. Each way to do it is a Backend, and
@@ -1912,10 +1998,7 @@ class Ptyxis(Tool):
     direct_error = None  # why the tab could last not be asked for
 
     def runs(self, pid):
-        try:
-            return read_proc(pid, "comm").strip() == "ptyxis-agent"  # the process every tab's shell is started by
-        except OSError:
-            return False
+        return proc_name(pid) == "ptyxis-agent"  # the process every tab's shell is started by
 
     def focus(self, pid, chain):
         if chain.index(pid) == 0:

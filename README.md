@@ -512,7 +512,7 @@ class MyTerminal(csd.Tool):
 
     def runs(self, pid):
         # Asked for each parent process of the session, nearest first.
-        return csd.read_proc(pid, "comm").strip() == "my-terminal"
+        return csd.proc_name(pid) == "my-terminal"
 
     def focus(self, pid, chain):
         # `chain` holds the session's parent processes; one of them is the
