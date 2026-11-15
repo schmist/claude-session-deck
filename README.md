@@ -88,9 +88,10 @@ usage there and has all its keys for sessions.
 
 **The usage key** (bottom right) shows the account's 5-hour and weekly usage
 limits, and the weekly limit of a model that has one of its own, such as
-Fable: percentage used, a bar and the time until reset. It turns amber above
-65% and red above 85%. The figures are a minute old at most. For accounts
-without such limits the key reads `no data yet`.
+Fable: percentage used, a bar and the time until reset. A bar turns amber
+when Anthropic rates its limit as a warning and red when as critical. The
+figures are a minute old at most. For accounts without such limits the key
+reads `no data yet`.
 
 ### Moving a session
 

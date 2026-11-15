@@ -1057,16 +1057,29 @@ def draw_key(info, t, name, shift, size):
     return img
 
 
-_usage = []  # what Anthropic gave last: (name, used fraction, when it resets) of each usage window, see ask_usage()
+# What Anthropic gave last: (name, used fraction, when it resets, severity) of each usage window, see ask_usage().
+_usage = []
 
 
 def account_usage():
-    """The account's usage windows as [(name, used fraction, seconds to reset)].
+    """The account's usage windows as [(name, used fraction, seconds to reset, severity)].
 
     Only what is known to hold now: the figure of a window that has reset says
     nothing about what the account has used since."""
     now = time.time()
-    return [(name, used, resets - now) for name, used, resets in _usage if resets > now]
+    return [(name, used, resets - now, severity) for name, used, resets, severity in _usage if resets > now]
+
+
+def usage_color(used, severity):
+    """Colour of a usage window's bar: Anthropic's reading of it, or the deck's own where it gave none."""
+    return {"critical": (255, 80, 80), "warning": (255, 190, 70), "normal": MASCOT_COLOR}.get(severity) \
+        or level_color(used, MASCOT_COLOR)
+
+
+def usage_accent(windows):
+    """Colour for all of `windows` together: that of the one that warns most."""
+    colors = [usage_color(used, severity) for _, used, _, severity in windows]
+    return max(colors, key=[MASCOT_COLOR, (255, 190, 70), (255, 80, 80)].index, default=MASCOT_COLOR)
 
 
 def fetch_usage():
@@ -1084,14 +1097,16 @@ def fetch_usage():
         "Authorization": "Bearer " + login["accessToken"], "User-Agent": "claude-session-deck"})
     with urllib.request.urlopen(request, timeout=10) as response:
         answer = json.load(response)
-    given = [(name, answer.get(field) or {}, "utilization")
-             for name, field in (("5h", "five_hour"), ("Week", "seven_day"))]
-    for limit in answer.get("limits") or []:  # the limits of one model's own, such as a week's Fable
+    limits = answer.get("limits") or []  # each limit once more, with its severity and the model it is for
+    severity = {limit.get("kind"): limit.get("severity") for limit in limits}
+    given = [(name, answer.get(field) or {}, "utilization", severity.get(kind))
+             for name, field, kind in (("5h", "five_hour", "session"), ("Week", "seven_day", "weekly_all"))]
+    for limit in limits:  # the limits of one model's own, such as a week's Fable
         model = ((limit.get("scope") or {}).get("model") or {}).get("display_name")
         if model:
-            given.append((model, limit, "percent"))
-    return [(name, (window.get(used) or 0) / 100, datetime.datetime.fromisoformat(window["resets_at"]).timestamp())
-            for name, window, used in given if window.get("resets_at")]
+            given.append((model, limit, "percent", limit.get("severity")))
+    return [(name, (window.get(used) or 0) / 100, datetime.datetime.fromisoformat(window["resets_at"]).timestamp(),
+             severe) for name, window, used, severe in given if window.get("resets_at")]
 
 
 def ask_usage():
@@ -1124,19 +1139,18 @@ def render_usage(size=UNIT):
     px = scaler(size)
     windows = account_usage()
     big = UNIT * SS
-    worst = max((used for _, used, _ in windows), default=0)
-    accent = level_color(worst, MASCOT_COLOR)
+    accent = usage_accent(windows)
     img = background(accent, 0.14)
     g = ImageDraw.Draw(img)
     g.rectangle((0, 0, big, 3 * SS), fill=mix(BASE, accent, 0.7))
     # Top of each window's block, then its text's baseline, its bar and its font sizes: three are closer together.
     rows = [4 + i * 19 if len(windows) > 2 else 7 + i * 27 for i in range(len(windows))]
     base, bar, sizes = (11, (13, 17), (10, 9, 13)) if len(windows) > 2 else (13, (16, 21), (11, 10, 15))
-    for y, (_, used, _) in zip(rows, windows):
+    for y, (_, used, _, severity) in zip(rows, windows):
         box = (PAD * SS, (y + bar[0]) * SS, (UNIT - PAD) * SS, (y + bar[1]) * SS)
         g.rounded_rectangle(box, 2.5 * SS, fill=TRACK)
         g.rounded_rectangle((box[0], box[1], box[0] + max(5 * SS, (box[2] - box[0]) * min(1, used)),
-                             box[3]), 2.5 * SS, fill=level_color(used, MASCOT_COLOR))
+                             box[3]), 2.5 * SS, fill=usage_color(used, severity))
     img = img.resize((size, size), Image.LANCZOS)
     d = ImageDraw.Draw(img)
     dim = (150, 156, 168)
@@ -1145,7 +1159,7 @@ def render_usage(size=UNIT):
         d.text((size / 2, px(24)), "usage", font=font(px(15)), fill=(255, 255, 255), anchor="mm")
         d.text((size / 2, px(42)), "no data yet", font=small, fill=dim, anchor="mm")
         return img
-    for y, (name, used, left) in zip(rows, windows):
+    for y, (name, used, left, _) in zip(rows, windows):
         d.text((px(PAD), px(y + base)), name, font=font(px(sizes[0])), fill=(255, 255, 255), anchor="ls")
         x = px(PAD) + font(px(sizes[0])).getlength(name) + px(3)
         d.text((x, px(y + base)), fmt_reset(left), font=small, fill=dim, anchor="ls")
@@ -1165,8 +1179,8 @@ _screens = {}  # what a screen was drawn from -> its image
 def render_screen(model, counts):
     """Image for a model's screen; `counts` are the sessions in each of PANELS' states."""
     windows = account_usage()
-    drawn = (model.id, tuple(counts), tuple((name, round(used * 100), fmt_reset(left))
-                                            for name, used, left in windows))
+    drawn = (model.id, tuple(counts), tuple((name, round(used * 100), fmt_reset(left), severity)
+                                            for name, used, left, severity in windows))
     if drawn not in _screens:
         if len(_screens) > 20:
             _screens.clear()
@@ -1213,20 +1227,19 @@ def draw_panels(size, counts, windows):
                           mix(accent, white, 0.25) if count else grey, "la"))
             texts.append(((x + 12, 64), str(count), font(50), white if count else grey, "lm"))
 
-        worst = max((used for _, used, _ in windows), default=0)
-        x = panel(parts - 1, level_color(worst, MASCOT_COLOR), 0.14, 0.7)
+        x = panel(parts - 1, usage_accent(windows), 0.14, 0.7)
         if not windows:
             texts.append(((x + pw / 2, 40), "usage", font(22), white, "mm"))
             texts.append(((x + pw / 2, 64), "no data yet", font(15, "Condensed Medium"), dim, "mm"))
         # Three windows are closer together: the rows' distance, the text's baseline, the bar and the font sizes.
         top, pitch, base, bar, sizes = (h * 0.05, h * 0.3, 16, (20, 25), (15, 13, 18)) if len(windows) > 2 \
             else (14, 40, 18, (24, 31), (17, 15, 22))
-        for row, (name, used, left) in enumerate(windows):
+        for row, (name, used, left, severity) in enumerate(windows):
             y = top + row * pitch
             box = ((x + 12) * SS, (y + bar[0]) * SS, (x + pw - 12) * SS, (y + bar[1]) * SS)
             g.rounded_rectangle(box, (bar[1] - bar[0]) / 2 * SS, fill=TRACK)
             g.rounded_rectangle((box[0], box[1], box[0] + max(7 * SS, (box[2] - box[0]) * min(1, used)),
-                                 box[3]), (bar[1] - bar[0]) / 2 * SS, fill=level_color(used, MASCOT_COLOR))
+                                 box[3]), (bar[1] - bar[0]) / 2 * SS, fill=usage_color(used, severity))
             texts.append(((x + 12, y + base), name, font(sizes[0]), white, "ls"))
             texts.append(((x + 12 + font(sizes[0]).getlength(name) + 5, y + base), fmt_reset(left),
                           font(sizes[1], "Condensed Medium"), dim, "ls"))
@@ -1256,12 +1269,12 @@ def draw_compact(size, counts, windows):
             texts.append((((left_edge + right_edge) / 2, h / 2), "no usage data",
                           font(11, "Condensed Medium"), dim, "mm"))
         rows = max(2, len(windows))
-        for row, (name, used, _) in enumerate(windows):
+        for row, (name, used, _, severity) in enumerate(windows):
             y = (5 if rows == 2 else 0) + row * (h - 6) // rows
             box = (left_edge * SS, (y + 14) * SS, right_edge * SS, (y + (18 if rows == 2 else 17)) * SS)
             g.rounded_rectangle(box, 2 * SS, fill=TRACK)
             g.rounded_rectangle((box[0], box[1], box[0] + max(4 * SS, (box[2] - box[0]) * min(1, used)),
-                                 box[3]), 2 * SS, fill=level_color(used, MASCOT_COLOR))
+                                 box[3]), 2 * SS, fill=usage_color(used, severity))
             texts.append(((left_edge, y + 11), name, font(11), white, "ls"))
             texts.append(((right_edge, y + 11), f"{round(used * 100)}%", font(12), white, "rs"))
         return texts
