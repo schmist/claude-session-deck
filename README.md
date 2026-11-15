@@ -38,9 +38,10 @@ It does not:
 
 - **Control a session.** It only reads. It cannot answer a permission prompt,
   send a prompt, or start, stop or interrupt a session.
-- **Use the network.** It makes no request to Anthropic or anyone else and
-  needs no login or API key; everything comes from files and processes on your
-  machine.
+- **Use the network**, except to ask Anthropic for the
+  [account usage](#how-the-rest-works) once a minute, with the login Claude
+  Code keeps on your machine. Everything else comes from files and processes
+  on your machine, and `USAGE_EVERY = 0` stops that request too.
 - **See other sessions than those above**: not those on other machines or in
   the cloud, not other users', and not non-interactive runs such as `claude -p`
   or subagents. On this machine it looks in `~/.claude` only; a session started
@@ -86,11 +87,8 @@ usage there and has all its keys for sessions.
 
 **The usage key** (bottom right) shows the account's 5-hour and weekly usage
 limits: percentage used, a bar and the time until reset. It turns amber above
-65% and red above 85%. The figures come from Claude Code, so they only update
-while a session is active. Until a session has replied since the computer
-started the key reads `no data yet`, as it does for accounts without such
-limits; a limit whose window has reset is left out until a session reports it
-again.
+65% and red above 85%. The figures are a minute old at most. For accounts
+without such limits the key reads `no data yet`.
 
 ### Moving a session
 
@@ -214,7 +212,8 @@ never writes to a session, its files or its terminal.
 | Which sessions run, and each one's name, folder, state and what it waits for | The file Claude Code keeps per running session, `~/.claude/sessions/<pid>.json` | 4 times a second |
 | Whether a session is still alive | `/proc/<pid>/stat`: the process must exist and have started when the file says | 4 times a second |
 | Running tool, context size, model | The last 400 kB of the session's transcript, `~/.claude/projects/<folder>/<session id>.jsonl`, when it changed | 4 times a second |
-| Account usage | `~/.claude/claude-session-deck/status.json`, saved by the status line command (below) | Once a second |
+| Account usage | Anthropic, asked with the login in `~/.claude/.credentials.json` (below) | Once a minute |
+| Account usage, between those answers | `~/.claude/claude-session-deck/status.json`, saved by the status line command (below) | Once a second |
 | The processes leading to a session's window | `/proc`: the session's parent processes | On a key press, and when a session starts or gets a prompt |
 
 Of a transcript the daemon keeps the name of the running tool, the token
@@ -252,25 +251,27 @@ A sandbox that is stopped is not started.
 
 ## How the rest works
 
-**Account usage.** Claude Code passes the account's usage limits to its status
-line command. The installer registers `statusline.sh` as that command; it
-saves the data for the daemon and then runs the status line you had before, if
-any. The uninstaller restores the previous setting, and a copy of your earlier
-settings is kept in `~/.claude/claude-session-deck/settings.json.before-claude-session-deck`.
+**Account usage.** The daemon asks Anthropic for the account's usage limits
+once a minute, as Claude Code's `/usage` does. It sends the access token of
+your Claude Code login, read from `~/.claude/.credentials.json`, to
+`api.anthropic.com` and nowhere else, and never writes that file: while the
+token is expired it does not ask, until Claude Code has renewed it. That
+request is not a documented interface and may stop working; the log then says
+`cannot ask Anthropic for the usage`.
+
+Claude Code also passes the limits to its status line command after each
+reply. The installer registers `statusline.sh` as that command; it saves the
+data for the daemon and then runs the status line you had before, if any. The
+daemon shows whichever figures are newer, so the usage follows a session that
+is working more closely than once a minute, and still shows if Anthropic does
+not answer. A reading from before the computer started is not shown, nor a
+limit whose window has reset. The uninstaller restores the previous setting,
+and a copy of your earlier settings is kept in
+`~/.claude/claude-session-deck/settings.json.before-claude-session-deck`.
 
 A project that sets a status line of its own in `.claude/settings.json`
-replaces yours, so its sessions save no usage. To have both, give the
-project's command to `statusline.sh` in the project's
-`.claude/settings.local.json`:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "~/.claude/claude-session-deck/statusline.sh 'bash .claude/status-line.sh'"
-  }
-}
-```
+replaces yours, so its sessions save nothing; the usage then comes from
+Anthropic alone.
 
 **Locked screen and sleep.** The login manager (logind) tells the daemon over
 D-Bus when a session of yours is locked and when the computer is about to
@@ -583,6 +584,7 @@ The settings are constants at the top of `claude_session_deck.py`; change them a
 | `HOLD_SECONDS` | `0.6` | How long a key is held to pick its session up |
 | `MOVE_SECONDS` | `10` | How long a session that was picked up waits for its new key |
 | `LOCK_EVERY`, `LOCK_SECONDS` | `16`, `12` | While the screen is locked, the creature appears every 16 s for 12 s |
+| `USAGE_EVERY` | `60` | Seconds between asking Anthropic for the account usage; `0` never asks, the usage then comes from the status line alone |
 | `NAME_EVERY` | `9` | Seconds between the scrolls of a name too long for its key |
 | `MASCOT_ANIMATIONS` | walk 35, think 25, peek 20, wave 20 | Relative probability of each animation |
 | `FONT` | Ubuntu variable font | Font file used for all text |
@@ -607,6 +609,6 @@ journalctl --user -u claude-session-deck -f     # log
 | Pressing a key does nothing, log shows both extensions as `not loaded` | Install Window Calls, or log out and in and run `gnome-extensions enable claude-session-deck-windows@local` |
 | Log shows `no window found for …` | The line lists each mechanism tried; none applies to your desktop, or no window matches the session |
 | The wrong terminal tab stays selected in a JetBrains IDE | The plugin is not loaded: run `./install.sh`, then restart the IDE. If the log shows `JetBrains IDE: cannot focus …`, see the IDE's own log (Help → Show Log) |
-| Usage key reads `no data yet` | The status line command is not set up (run `./install.sh` again), no session has replied since the computer started, the sessions' project has a [status line of its own](#how-the-rest-works), or the account has no usage limits |
+| Usage key reads `no data yet` | The account has no usage limits or you are not logged in to Claude Code with it, or Anthropic does not answer (the log then shows `cannot ask Anthropic for the usage`) and no session has saved the usage through the status line since the computer started |
 | A session is missing | It is not interactive, it uses another `CLAUDE_CONFIG_DIR`, or it runs where no [source](#how-sessions-are-found-and-read) looks: a container whose process is not yours, a kind of sandbox the daemon does not know, another machine. The deck may also have fewer keys than there are sessions |
 | Log shows `cannot load plugin …` or `…: cannot look for sessions: …` | A [plugin](#extending) failed; the line says why |

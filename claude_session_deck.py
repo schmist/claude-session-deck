@@ -3,6 +3,7 @@
 import collections
 import ctypes
 import ctypes.util
+import datetime
 import fcntl
 import glob
 import io
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -30,6 +32,9 @@ CLAUDE_DIR = os.path.expanduser("~/.claude")  # where Claude Code keeps its sess
 PLUGINS_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
                            "claude-session-deck", "plugins")           # see load_plugins()
 STATUS_FILE = os.path.expanduser("~/.claude/claude-session-deck/status.json")   # written by statusline.sh
+LOGIN_FILE = os.path.join(CLAUDE_DIR, ".credentials.json")  # Claude Code's login, see ask_usage()
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_EVERY = 60            # seconds between asking Anthropic for the account usage; 0 never asks
 WINDOWS_FILE = os.path.expanduser("~/.cache/claude-session-deck/windows.json")  # see learn_window()
 PLACES_FILE = os.path.expanduser("~/.cache/claude-session-deck/places.json")    # see Sessions.place()
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
@@ -1054,31 +1059,80 @@ def draw_key(info, t, name, shift, size):
 
 
 _usage = (None, None)  # (mtime of STATUS_FILE, its rate limits)
+_asked = (0, {})        # (when Anthropic answered, the rate limits it gave), see ask_usage()
 
 
 def account_usage():
     """The account's usage windows as [(name, used fraction, seconds to reset)].
 
+    From Anthropic's answer or what the status line saved, whichever is newer.
     Only what is known to hold now: a reading saved before the computer started
     says nothing about what the account has used since, and neither does the
     figure of a window that has reset."""
     global _usage
+    readings = [_asked]
     try:
         mtime = os.stat(STATUS_FILE).st_mtime
         if _usage[0] != mtime:
             _usage = (mtime, read_json(STATUS_FILE).get("rate_limits") or {})
+        readings.append(_usage)
     except (OSError, ValueError):
-        return []
+        pass
+    when, limits = max(readings, key=lambda reading: reading[0])
     now = time.time()
-    if mtime < now - time.clock_gettime(time.CLOCK_BOOTTIME):
+    if when < now - time.clock_gettime(time.CLOCK_BOOTTIME):
         return []
     windows = []
     for name, field in (("5h", "five_hour"), ("week", "seven_day")):
-        window = _usage[1].get(field)
+        window = limits.get(field)
         left = (window.get("resets_at") or 0) - now if window else 0
         if left > 0:
             windows.append((name, (window.get("used_percentage") or 0) / 100, left))
     return windows
+
+
+def fetch_usage():
+    """The account's rate limits as Anthropic gives them now, in the form of the status line's.
+
+    None without a login that is valid now. The login is Claude Code's and only
+    read: renewing it is left to Claude Code, which would lose it otherwise."""
+    try:
+        login = read_json(LOGIN_FILE).get("claudeAiOauth") or {}
+    except (OSError, ValueError):
+        return None
+    if not login.get("accessToken") or (login.get("expiresAt") or 0) / 1000 < time.time():
+        return None
+    request = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": "Bearer " + login["accessToken"], "User-Agent": "claude-session-deck"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        answer = json.load(response)
+    limits = {}
+    for field in ("five_hour", "seven_day"):
+        window = answer.get(field)
+        if window and window.get("resets_at"):
+            limits[field] = {"used_percentage": window.get("utilization") or 0,
+                             "resets_at": datetime.datetime.fromisoformat(window["resets_at"]).timestamp()}
+    return limits
+
+
+def ask_usage():
+    """Keep asking Anthropic for the account usage; meant to run in a thread of its own.
+
+    So the usage shows whatever status line a session has, and before any replied."""
+    global _asked
+    wait, failed = USAGE_EVERY, None
+    while True:
+        try:
+            limits, error = fetch_usage(), None
+        except Exception as e:  # no network, or Anthropic refuses
+            limits, error = None, str(e)
+        if limits is not None:
+            _asked = (time.time(), limits)
+        if error != failed:
+            failed = error
+            log(f"cannot ask Anthropic for the usage: {error}" if error else "Anthropic gives the usage again")
+        wait = min(wait * 2, 15 * 60) if error else USAGE_EVERY  # ask a server that refuses less often
+        time.sleep(wait)
 
 
 def fmt_reset(left):
@@ -2389,6 +2443,8 @@ def main():
     decks, errors = {}, {}  # both by path
     board = Sessions()
     login = Login()
+    if USAGE_EVERY:
+        threading.Thread(target=ask_usage, daemon=True).start()
     next_frame = next_scan = next_look = 0.0
 
     def lose(deck, error):  # unplugged, or its emulator ended
