@@ -258,6 +258,20 @@ saves the data for the daemon and then runs the status line you had before, if
 any. The uninstaller restores the previous setting, and a copy of your earlier
 settings is kept in `~/.claude/claude-session-deck/settings.json.before-claude-session-deck`.
 
+A project that sets a status line of its own in `.claude/settings.json`
+replaces yours, so its sessions save no usage. To have both, give the
+project's command to `statusline.sh` in the project's
+`.claude/settings.local.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/claude-session-deck/statusline.sh 'bash .claude/status-line.sh'"
+  }
+}
+```
+
 **Locked screen and sleep.** The login manager (logind) tells the daemon over
 D-Bus when a session of yours is locked and when the computer is about to
 sleep. The daemon asks it to wait with sleeping until the decks are dark,
@@ -593,6 +607,6 @@ journalctl --user -u claude-session-deck -f     # log
 | Pressing a key does nothing, log shows both extensions as `not loaded` | Install Window Calls, or log out and in and run `gnome-extensions enable claude-session-deck-windows@local` |
 | Log shows `no window found for …` | The line lists each mechanism tried; none applies to your desktop, or no window matches the session |
 | The wrong terminal tab stays selected in a JetBrains IDE | The plugin is not loaded: run `./install.sh`, then restart the IDE. If the log shows `JetBrains IDE: cannot focus …`, see the IDE's own log (Help → Show Log) |
-| Usage key reads `no data yet` | The status line command is not set up (run `./install.sh` again), no session has replied since the computer started, or the account has no usage limits |
+| Usage key reads `no data yet` | The status line command is not set up (run `./install.sh` again), no session has replied since the computer started, the sessions' project has a [status line of its own](#how-the-rest-works), or the account has no usage limits |
 | A session is missing | It is not interactive, it uses another `CLAUDE_CONFIG_DIR`, or it runs where no [source](#how-sessions-are-found-and-read) looks: a container whose process is not yours, a kind of sandbox the daemon does not know, another machine. The deck may also have fewer keys than there are sessions |
 | Log shows `cannot load plugin …` or `…: cannot look for sessions: …` | A [plugin](#extending) failed; the line says why |

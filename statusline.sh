@@ -1,6 +1,7 @@
 #!/bin/sh
 # Claude Code status line command: saves the session JSON from stdin for the
 # claude-session-deck daemon, then runs the status line that was configured before.
+# A project with a status line of its own passes that command as the argument.
 dir="$HOME/.claude/claude-session-deck"
 input=$(cat)
 # A session reports no usage limits until its first reply, so only input that
@@ -9,6 +10,8 @@ case $input in
     *'"five_hour"'* | *'"seven_day"'*)
         printf '%s' "$input" > "$dir/status.json.$$" && mv "$dir/status.json.$$" "$dir/status.json" ;;
 esac
-if [ -s "$dir/statusline-original" ]; then
+if [ $# -gt 0 ]; then
+    printf '%s' "$input" | sh -c "$1"
+elif [ -s "$dir/statusline-original" ]; then
     printf '%s' "$input" | sh -c "$(cat "$dir/statusline-original")"
 fi
