@@ -39,9 +39,9 @@ It does not:
 - **Control a session.** It only reads. It cannot answer a permission prompt,
   send a prompt, or start, stop or interrupt a session.
 - **Use the network**, except to ask Anthropic for the
-  [account usage](#how-the-rest-works) once a minute, with the login Claude
-  Code keeps on your machine. Everything else comes from files and processes
-  on your machine. `USAGE_EVERY = 0` stops that request; the usage is then
+  [account usage](#how-the-rest-works) every five minutes while a session
+  works, with the login Claude Code keeps on your machine. Everything else
+  comes from files and processes on your machine. `USAGE_EVERY = 0` stops that request; the usage is then
   not shown.
 - **See other sessions than those above**: not those on other machines or in
   the cloud, not other users', and not non-interactive runs such as `claude -p`
@@ -90,7 +90,7 @@ usage there and has all its keys for sessions.
 limits, and the weekly limit of a model that has one of its own, such as
 Fable: percentage used, a bar and the time until reset. A bar turns amber
 when Anthropic rates its limit as a warning and red when as critical. The
-figures are a minute old at most. For accounts without such limits the key
+figures are five minutes old at most. For accounts without such limits the key
 reads `no data yet`.
 
 ### Moving a session
@@ -213,7 +213,7 @@ never writes to a session, its files or its terminal.
 | Which sessions run, and each one's name, folder, state and what it waits for | The file Claude Code keeps per running session, `~/.claude/sessions/<pid>.json` | 4 times a second |
 | Whether a session is still alive | `/proc/<pid>/stat`: the process must exist and have started when the file says | 4 times a second |
 | Running tool, context size, model | The last 400 kB of the session's transcript, `~/.claude/projects/<folder>/<session id>.jsonl`, when it changed | 4 times a second |
-| Account usage | Anthropic, asked with the login in `~/.claude/.credentials.json` (below) | Once a minute |
+| Account usage | Anthropic, asked with the login in `~/.claude/.credentials.json` (below) | Every 5 minutes at most, and only after a session has worked |
 | The processes leading to a session's window | `/proc`: the session's parent processes | On a key press, and when a session starts or gets a prompt |
 
 Of a transcript the daemon keeps the name of the running tool, the token
@@ -252,10 +252,12 @@ A sandbox that is stopped is not started.
 ## How the rest works
 
 **Account usage.** The daemon asks Anthropic for the account's usage limits
-once a minute, as Claude Code's `/usage` does. It sends the access token of
-your Claude Code login, read from `~/.claude/.credentials.json`, to
-`api.anthropic.com` and nowhere else, and never writes that file: while the
-token is expired it does not ask, until Claude Code has renewed it. That
+as Claude Code's `/usage` does: after a session has worked, as the usage does
+not change otherwise, and every five minutes at most, as Anthropic refuses
+who asks more often. It sends the access token of your Claude Code login,
+read from `~/.claude/.credentials.json`, to `api.anthropic.com` and nowhere
+else, and never writes that file: while the token is expired it does not ask,
+until Claude Code has renewed it. That
 request is not a documented interface and may stop working; the log then says
 `cannot ask Anthropic for the usage`.
 
@@ -573,7 +575,7 @@ The settings are constants at the top of `claude_session_deck.py`; change them a
 | `HOLD_SECONDS` | `0.6` | How long a key is held to pick its session up |
 | `MOVE_SECONDS` | `10` | How long a session that was picked up waits for its new key |
 | `LOCK_EVERY`, `LOCK_SECONDS` | `16`, `12` | While the screen is locked, the creature appears every 16 s for 12 s |
-| `USAGE_EVERY` | `60` | Seconds between asking Anthropic for the account usage; `0` never asks, and the usage key reads `no data yet` |
+| `USAGE_EVERY` | `300` | Least seconds between asking Anthropic for the account usage; `0` never asks, and the usage key reads `no data yet` |
 | `NAME_EVERY` | `9` | Seconds between the scrolls of a name too long for its key |
 | `MASCOT_ANIMATIONS` | walk 35, think 25, peek 20, wave 20 | Relative probability of each animation |
 | `FONT` | Ubuntu variable font | Font file used for all text |

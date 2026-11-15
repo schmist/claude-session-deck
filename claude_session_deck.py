@@ -33,7 +33,7 @@ PLUGINS_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expandus
                            "claude-session-deck", "plugins")           # see load_plugins()
 LOGIN_FILE = os.path.join(CLAUDE_DIR, ".credentials.json")  # Claude Code's login, see ask_usage()
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-USAGE_EVERY = 60            # seconds between asking Anthropic for the account usage; 0 never asks
+USAGE_EVERY = 300           # least seconds between asking Anthropic for the account usage; 0 never asks
 WINDOWS_FILE = os.path.expanduser("~/.cache/claude-session-deck/windows.json")  # see learn_window()
 PLACES_FILE = os.path.expanduser("~/.cache/claude-session-deck/places.json")    # see Sessions.place()
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
@@ -1209,19 +1209,29 @@ def fetch_usage():
              severe) for name, window, used, severe in given if window.get("resets_at")]
 
 
+_worked = threading.Event()  # a session has worked since Anthropic was asked for the usage
+_worked.set()                # and what the account used before the daemon started is not known either
+
+
 def ask_usage():
     """Keep asking Anthropic for the account usage; meant to run in a thread of its own.
 
-    While Anthropic does not answer, what it gave last stays."""
+    Only after a session has worked, as the usage does not change otherwise,
+    and seldom: Anthropic refuses who asks often. While it does not answer,
+    what it gave last stays."""
     global _usage
     wait, failed = USAGE_EVERY, None
     while True:
+        _worked.wait()
+        _worked.clear()
         try:
             limits, error = fetch_usage(), None
         except Exception as e:  # no network, or Anthropic refuses
             limits, error = None, str(e)
         if limits is not None:
             _usage = limits
+        else:
+            _worked.set()  # still to be asked
         if error != failed:
             failed = error
             log(f"cannot ask Anthropic for the usage: {error}" if error else "Anthropic gives the usage again")
@@ -2328,6 +2338,8 @@ class Sessions:
         for place, sid in enumerate(self.by_age):
             session = sessions[sid]
             status = session.get("status", "?")
+            if status == "busy":
+                _worked.set()  # see ask_usage()
             previous = self.last_status.get(sid)
             if status != previous:
                 if status == "idle" and previous == "busy":
