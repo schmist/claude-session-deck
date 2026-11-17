@@ -159,6 +159,13 @@ fi
 info "Installing the daemon to $app_dir"
 install -Dm755 "$here/claude_session_deck.py" "$app_dir/claude_session_deck.py"
 install -Dm644 "$here/systemd/claude-session-deck.service" "$unit_dir/claude-session-deck.service"
+# Where this was installed from, and which commit: the daemon tells from it when there is a newer one.
+if [ "$(git -C "$here" rev-parse --show-toplevel 2>/dev/null)" = "$here" ] &&
+    commit=$(git -C "$here" rev-parse HEAD 2>/dev/null); then
+    printf '%s\n%s\n' "$here" "$commit" > "$app_dir/installed-from"
+else
+    rm -f "$app_dir/installed-from"  # not a clone: there is nothing to pull updates into
+fi
 
 # --- GNOME: an extension is needed to focus windows ---------------------------
 # "Window Calls" is preferred: GNOME loads it right away, the bundled one only at login.

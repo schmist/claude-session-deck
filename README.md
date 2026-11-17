@@ -31,6 +31,8 @@ It does:
 - Let you [move a session to another key](#moving-a-session): hold its key,
   then press the key it is to be on.
 - Drive several decks of different [models](#decks) at once, real or emulated.
+- Tell you when there is a [newer version](#updates), and install it when you
+  press the key that says so.
 - Take [plugins](#extending) for other places to find sessions, other
   desktops, other terminals and IDEs, other sandboxes and other deck models.
 
@@ -42,7 +44,9 @@ It does not:
   [account usage](#how-the-rest-works) every five minutes while a session
   works, with the login Claude Code keeps on your machine. Everything else
   comes from files and processes on your machine. `USAGE_EVERY = 0` stops that request; the usage is then
-  not shown.
+  not shown. And to look for a [newer version](#updates) every five minutes, by
+  asking the server of the clone it was installed from where its branch is;
+  `UPDATE_EVERY = 0` stops that.
 - **See other sessions than those above**: not those on other machines or in
   the cloud, not other users', and not non-interactive runs such as `claude -p`
   or subagents. On this machine it looks in `~/.claude` only; a session started
@@ -92,6 +96,27 @@ Fable: percentage used, a bar and the time until reset. A bar turns amber
 when Anthropic rates its limit as a warning and red when as critical. The
 figures are five minutes old at most. For accounts without such limits the key
 reads `no data yet`.
+
+### Updates
+
+Every five minutes the daemon asks the server of the clone it was installed from
+where the branch is that the clone follows. It asks over https and without a
+login, also if the clone uses ssh, so no key is used and nothing is fetched;
+this needs a repository that anyone may read. When the branch has moved on, the bottom-right key
+reads `update` in place of the usage, on a deck with a screen in place of the
+session that key would show. Nothing is installed by itself:
+
+| What you do | What happens |
+|---|---|
+| Press the key | The update is installed: `git pull --ff-only` in the clone, then its `./install.sh`, which starts the daemon anew. The key reads `installing` until then. The pull goes the clone's own way, so it may ask for your ssh key |
+| Hold the key for 0.6 s | No update is shown for 24 hours, also not a newer one. The key shows the usage again |
+
+Installed this way, `install.sh` asks nothing and uses no `sudo`: it renews
+what is installed and leaves out what it would have to ask about. If the
+clone has changes of its own that keep git from pulling, or the install
+fails, the key reads `failed` and `journalctl --user -u claude-session-deck-update`
+tells why; press it to try again. A daemon that was not installed from a git
+clone does not look for updates.
 
 ### Moving a session
 
@@ -177,11 +202,13 @@ counts as no. Everything else is installed for the current user only:
 | What | Where |
 |---|---|
 | Daemon | `~/.local/share/claude-session-deck/claude_session_deck.py` |
+| The clone it was installed from, and its commit then | `~/.local/share/claude-session-deck/installed-from` |
 | Service | `~/.config/systemd/user/claude-session-deck.service` |
 | Bundled GNOME extension, if Window Calls is not used | `~/.local/share/gnome-shell/extensions/claude-session-deck-windows@local/` |
 | JetBrains plugin | `~/.local/share/JetBrains/<IDE and version>/claude-session-deck/` (Android Studio: under `Google/`) |
 
-To update, pull and run `./install.sh` again: it replaces the daemon, rebuilds
+To update, press the key that [tells about an update](#updates), or pull and
+run `./install.sh` again: it replaces the daemon, rebuilds
 the plugin of each IDE that has it, restarts the service and asks only about
 what is not set up yet. Sessions keep the keys you moved them to. To remove,
 run `./uninstall.sh`.
@@ -220,7 +247,8 @@ Of a transcript the daemon keeps the name of the running tool, the token
 counts of the last reply and the model; the conversation itself is not kept,
 shown or logged. What it writes is the window it remembered for each session,
 in `~/.cache/claude-session-deck/windows.json`, the keys you moved sessions
-to, in `places.json` next to it, and its log.
+to, in `places.json` next to it, until when an update is not shown, in
+`update.json` there, and its log.
 
 These files are internal to Claude Code, so an update can break
 claude-session-deck.
@@ -576,6 +604,8 @@ The settings are constants at the top of `claude_session_deck.py`; change them a
 | `MOVE_SECONDS` | `10` | How long a session that was picked up waits for its new key |
 | `LOCK_EVERY`, `LOCK_SECONDS` | `16`, `12` | While the screen is locked, the creature appears every 16 s for 12 s |
 | `USAGE_EVERY` | `300` | Least seconds between asking Anthropic for the account usage; `0` never asks, and the usage key reads `no data yet` |
+| `UPDATE_EVERY` | `300` | Seconds between looks for a newer version; `0` never looks |
+| `UPDATE_SILENCE` | `86400` | Seconds no update is shown after its key was held |
 | `NAME_EVERY` | `9` | Seconds between the scrolls of a name too long for its key |
 | `MASCOT_ANIMATIONS` | walk 35, think 25, peek 20, wave 20 | Relative probability of each animation |
 | `FONT` | Ubuntu variable font | Font file used for all text |

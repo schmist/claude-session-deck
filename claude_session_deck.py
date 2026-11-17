@@ -35,6 +35,11 @@ LOGIN_FILE = os.path.join(CLAUDE_DIR, ".credentials.json")  # Claude Code's logi
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 USAGE_EVERY = 300           # least seconds between asking Anthropic for the account usage; 0 never asks
 LOGIN_EVERY = 5             # seconds between looks at LOGIN_FILE while its login has expired
+UPDATE_EVERY = 300          # seconds between looks for a newer version than the installed one; 0 never looks
+UPDATE_SILENCE = 24 * 3600  # seconds an update is not shown after its key was held
+UPDATE_UNIT = "claude-session-deck-update"  # the systemd unit that installs an update, see install_update()
+INSTALLED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "installed-from")  # see installed_from()
+UPDATE_FILE = os.path.expanduser("~/.cache/claude-session-deck/update.json")    # see silence_update()
 WINDOWS_FILE = os.path.expanduser("~/.cache/claude-session-deck/windows.json")  # see learn_window()
 PLACES_FILE = os.path.expanduser("~/.cache/claude-session-deck/places.json")    # see Sessions.place()
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
@@ -1409,6 +1414,175 @@ def usage_key(size, now):
     return _usage_keys[size][1]
 
 
+# --------------------------------------------------------------- updates ---
+# install.sh notes the clone it ran in and that clone's commit. The daemon
+# asks the server where the branch is that the clone follows, and shows a key
+# when that has moved on; the key pulls it into the clone and runs install.sh
+# there, or is held to be left in peace for a while. Nothing is installed
+# without that press.
+_update = None       # the commit that can be installed, once one is found
+_update_state = ""   # "installing" while it is being installed, "failed" after that went wrong
+_silent_until = 0.0  # epoch seconds until which an update is not shown, see silence_update()
+
+
+def installed_from():
+    """(clone, commit) that install.sh installed this daemon from; None if it was not installed from a clone."""
+    try:
+        with open(INSTALLED_FILE) as f:
+            clone, commit = f.read().splitlines()[:2]
+    except (OSError, ValueError):
+        return None
+    return (clone, commit) if clone and commit else None
+
+
+GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes"}  # git is to fail, not to ask
+
+
+def git(clone, *args):
+    """What git prints for `args` in `clone`."""
+    return subprocess.run(["git", "-C", clone, *args], capture_output=True, text=True, timeout=120,
+                          env={**os.environ, **GIT_ENV}, check=True).stdout.strip()
+
+
+def public_url(url):
+    """The https address of a git remote that is given as `url`, which may be one for ssh."""
+    found = re.fullmatch(r"(?:https?://|ssh://(?:[^@/]+@)?)([^/:]+)(?::\d+)?/(.+?)/?", url) \
+        or re.fullmatch(r"(?:[^@/]+@)?([^/:]+):(.+?)/?", url)  # user@host:path, as scp takes it
+    if not found:
+        raise ValueError(f"{url} is not on a server")
+    return "https://{}/{}".format(*found.groups())
+
+
+def find_update(clone, commit):
+    """The commit that a pull in `clone` would bring, or None if `commit` has it already.
+
+    The server is asked over https and without a login, as anyone may ask
+    about a public repository: the clone's own way may need an ssh key, which
+    a daemon is not to use every few hours. Nothing is fetched."""
+    remote, branch = git(clone, "rev-parse", "--abbrev-ref", "@{upstream}").split("/", 1)
+    url = public_url(git(clone, "remote", "get-url", remote)) + "/info/refs?service=git-upload-pack"
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "git/2"}), timeout=30) as answer:
+        refs = answer.read().decode("utf-8", "replace")
+    found = re.search(r"([0-9a-f]{40}) refs/heads/%s[\0\n]" % re.escape(branch), refs)  # after the line's length
+    if not found:
+        raise ValueError(f"{url} does not tell where {branch} is")
+    newest = found.group(1)
+    known = subprocess.run(["git", "-C", clone, "merge-base", "--is-ancestor", newest, commit], capture_output=True)
+    return None if known.returncode == 0 else newest
+
+
+def watch_updates():
+    """Keep looking for a newer version; meant to run in a thread of its own."""
+    global _update
+    source = installed_from()
+    if not source:
+        return
+    failed = None
+    while True:
+        try:
+            found, error = find_update(*source), None
+        except subprocess.CalledProcessError as e:  # the clone follows nothing
+            found, error = _update, (e.stderr.strip().splitlines() or [str(e)])[-1]
+        except (OSError, ValueError, subprocess.SubprocessError) as e:  # no git, or the server does not tell
+            found, error = _update, str(e)
+        if error != failed:
+            failed = error
+            log(f"cannot look for updates in {source[0]}: {error}" if error else "can look for updates again")
+        if found != _update:
+            _update = found
+            if found:
+                log(f"an update can be installed: {found[:7]}, in place of {source[1][:7]}")
+            wake()
+        time.sleep(min(UPDATE_EVERY, 600) if error else UPDATE_EVERY)
+
+
+def update_shown():
+    """Whether a key is to tell about an update."""
+    return bool(_update_state == "installing" or (_update and time.time() >= _silent_until))
+
+
+def read_silence():
+    """Take up what silence_update() kept before the daemon was started anew."""
+    global _silent_until
+    try:
+        _silent_until = float(read_json(UPDATE_FILE).get("silent_until") or 0)
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+
+
+def silence_update():
+    """Show no update for UPDATE_SILENCE, also not one that is found in that time."""
+    global _silent_until
+    if _update_state != "installing":
+        _silent_until = time.time() + UPDATE_SILENCE
+        save_json(UPDATE_FILE, {"silent_until": _silent_until}, "that the update is silenced")
+        log(f"no update is shown for {fmt_duration(UPDATE_SILENCE)}")
+
+
+def install_update():
+    """Install the update that was found, unless that is under way; returns at once."""
+    global _update_state
+    if _update_state != "installing" and installed_from():
+        _update_state = "installing"
+        threading.Thread(target=run_update, daemon=True).start()
+
+
+def run_update():
+    """Pull the update into the clone and run its install.sh, which starts the daemon anew.
+
+    As a systemd unit of its own, as a process of this service would end with
+    it. Without a terminal install.sh asks nothing, so it only renews what is
+    installed already."""
+    global _update_state
+    clone = installed_from()[0]
+    try:
+        subprocess.run(["systemd-run", "--user", "--quiet", "--collect", "--wait", "--unit", UPDATE_UNIT,
+                        "--working-directory", clone, *(f"--setenv={name}={value}" for name, value in GIT_ENV.items()),
+                        "/bin/sh", "-c", "git pull --ff-only && exec ./install.sh"],
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
+        error = "install.sh did not start the daemon anew"  # it would not have returned otherwise
+    except subprocess.CalledProcessError as e:
+        if e.returncode < 0:  # ended by a signal, as all of this service is when install.sh starts it anew
+            return
+        error = e.stderr.strip() or f"it ended with status {e.returncode}"
+    except OSError as e:  # no systemd-run
+        error = str(e)
+    log(f"cannot install the update, see journalctl --user -u {UPDATE_UNIT}: {error}")
+    _update_state = "failed"
+    wake()
+
+
+UPDATE_COLOR = (90, 160, 255)
+_update_keys = {}  # (size, state) -> the image
+
+
+def update_key(size):
+    """Image of `size` pixels for the key that tells about an update and installs it."""
+    if (size, _update_state) not in _update_keys:
+        px = scaler(size)
+        accent = ACCENT["waiting"] if _update_state == "failed" else UPDATE_COLOR
+        img = background(accent, 0.3)
+        ImageDraw.Draw(img).rectangle((0, 0, UNIT * SS, 3 * SS), fill=mix(BASE, accent, 0.9))
+        img = img.resize((size, size), Image.LANCZOS)
+        d = ImageDraw.Draw(img)
+        lines = {"installing": ("installing", "the daemon", "starts anew"),
+                 "failed": ("failed", "press: again", "hold: later")}.get(
+                     _update_state, ("update", "press: install", "hold: later"))
+        d.text((size / 2, px(17)), lines[0], font=font(px(16)), fill=(255, 255, 255), anchor="mm")
+        for y, line in zip((37, 51), lines[1:]):
+            d.text((size / 2, px(y)), line, font=font(px(11), "Condensed Medium"), fill=(190, 196, 208), anchor="mm")
+        _update_keys[size, _update_state] = img
+    return _update_keys[size, _update_state]
+
+
+def spare_key(deck):
+    """The key of a deck that is not for sessions, or None if all are.
+
+    The last one: for the account usage on a deck without a screen, and on
+    every deck for an update while one is shown."""
+    return deck.model.keys - 1 if update_shown() or not deck.model.screen else None
+
+
 # ------------------------------------------------------------- sandboxes ---
 # A container shares the host's kernel, so its processes and files show up in
 # /proc and Containers finds them. A virtual machine or another host shows
@@ -2438,18 +2612,18 @@ def show(deck, board, now, frames):
 
     `frames` holds the images drawn for this moment, which decks with keys of one size share."""
     keys, size = deck.model.keys, deck.model.size
-    # The account usage is on the deck's screen, or on the last key if it has none.
-    usage = None if deck.model.screen else keys - 1
+    # The account usage is on the deck's screen, or on the last key if it has none; an update takes that key.
+    spare, update = spare_key(deck), update_shown()
     deck.slots = (board.slots + [None] * keys)[:keys]
     if deck.model.screen:
         deck.set_screen(render_screen(deck.model, board.counts()))
-    else:
-        deck.slots[usage] = None
+    if spare is not None:
+        deck.slots[spare] = None
     rate = 2
     for key, sid in enumerate(deck.slots):
         info = board.infos.get(sid)
-        if key == usage:
-            image = usage_key(size, now)
+        if key == spare:
+            image = update_key(size) if update else usage_key(size, now)
         elif info is None:
             image = target(size) if board.moving else blank(size)
         else:
@@ -2483,8 +2657,12 @@ def act(deck, board, control, value):
     """Do what a press, turn or touch on a deck asks for; returns whether it jumped to a session."""
     model = deck.model
     if control in ("key", "hold"):
+        spare = spare_key(deck)
         if board.moving:  # any press puts it down: on that key, or where it was if the key is not for sessions
-            board.place(value, model.keys - (0 if model.screen else 1))
+            board.place(value, model.keys - (0 if spare is None else 1))
+            return False
+        if value == spare and update_shown():  # pressed, the update is installed; held, it is left for later
+            (silence_update if control == "hold" else install_update)()
             return False
         if control == "hold":
             board.pick(deck.slots[value])
@@ -2545,6 +2723,9 @@ def main():
     login = Login()
     if USAGE_EVERY:
         threading.Thread(target=ask_usage, daemon=True).start()
+    if UPDATE_EVERY:
+        read_silence()
+        threading.Thread(target=watch_updates, daemon=True).start()
     next_frame = next_scan = next_look = 0.0
 
     def lose(deck, error):  # unplugged, or its emulator ended
