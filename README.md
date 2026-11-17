@@ -102,9 +102,10 @@ reads `no data yet`.
 Every five minutes the daemon asks the server of the clone it was installed from
 where the branch is that the clone follows. It asks over https and without a
 login, also if the clone uses ssh, so no key is used and nothing is fetched;
-this needs a repository that anyone may read. When the branch has moved on, the bottom-right key
-reads `update` in place of the usage, on a deck with a screen in place of the
-session that key would show. Nothing is installed by itself:
+this needs a repository that anyone may read. When the branch has moved on,
+the bottom-right key reads `update` in place of the usage, on a deck with a
+screen in place of the session that key would show. Nothing is installed by
+itself:
 
 | What you do | What happens |
 |---|---|
