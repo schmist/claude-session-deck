@@ -257,7 +257,7 @@ not change otherwise, and every five minutes at most, as Anthropic refuses
 who asks more often. It sends the access token of your Claude Code login,
 read from `~/.claude/.credentials.json`, to `api.anthropic.com` and nowhere
 else, and never writes that file: while the token is expired it does not ask,
-until Claude Code has renewed it. That
+and it asks within seconds once Claude Code has renewed it. That
 request is not a documented interface and may stop working; the log then says
 `cannot ask Anthropic for the usage`.
 

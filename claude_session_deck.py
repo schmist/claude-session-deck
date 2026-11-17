@@ -34,6 +34,7 @@ PLUGINS_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expandus
 LOGIN_FILE = os.path.join(CLAUDE_DIR, ".credentials.json")  # Claude Code's login, see ask_usage()
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 USAGE_EVERY = 300           # least seconds between asking Anthropic for the account usage; 0 never asks
+LOGIN_EVERY = 5             # seconds between looks at LOGIN_FILE while its login has expired
 WINDOWS_FILE = os.path.expanduser("~/.cache/claude-session-deck/windows.json")  # see learn_window()
 PLACES_FILE = os.path.expanduser("~/.cache/claude-session-deck/places.json")    # see Sessions.place()
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
@@ -1182,19 +1183,23 @@ def usage_accent(windows):
     return max(colors, key=[MASCOT_COLOR, (255, 190, 70), (255, 80, 80)].index, default=MASCOT_COLOR)
 
 
-def fetch_usage():
-    """The account's usage windows as Anthropic gives them now, in the form of _usage.
+def login_token():
+    """The token of Claude Code's login, or None while there is no login that is valid now.
 
-    None without a login that is valid now. The login is Claude Code's and only
-    read: renewing it is left to Claude Code, which would lose it otherwise."""
+    The login is only read: renewing it is left to Claude Code, which would lose it otherwise."""
     try:
         login = read_json(LOGIN_FILE).get("claudeAiOauth") or {}
     except (OSError, ValueError):
         return None
-    if not login.get("accessToken") or (login.get("expiresAt") or 0) / 1000 < time.time():
+    if (login.get("expiresAt") or 0) / 1000 < time.time():
         return None
+    return login.get("accessToken") or None
+
+
+def fetch_usage(token):
+    """The account's usage windows as Anthropic gives them now to the login of `token`, in the form of _usage."""
     request = urllib.request.Request(USAGE_URL, headers={
-        "Authorization": "Bearer " + login["accessToken"], "User-Agent": "claude-session-deck"})
+        "Authorization": "Bearer " + token, "User-Agent": "claude-session-deck"})
     with urllib.request.urlopen(request, timeout=10) as response:
         answer = json.load(response)
     limits = answer.get("limits") or []  # each limit once more, with its severity and the model it is for
@@ -1218,19 +1223,21 @@ def ask_usage():
 
     Only after a session has worked, as the usage does not change otherwise,
     and seldom: Anthropic refuses who asks often. While it does not answer,
-    what it gave last stays."""
+    what it gave last stays. While the login has expired it is not asked, and
+    then as soon as Claude Code has renewed the login."""
     global _usage
     wait, failed = USAGE_EVERY, None
     while True:
         _worked.wait()
+        token = login_token()
+        if not token:
+            time.sleep(LOGIN_EVERY)
+            continue
         _worked.clear()
         try:
-            limits, error = fetch_usage(), None
+            _usage, error = fetch_usage(token), None
         except Exception as e:  # no network, or Anthropic refuses
-            limits, error = None, str(e)
-        if limits is not None:
-            _usage = limits
-        else:
+            error = str(e)
             _worked.set()  # still to be asked
         if error != failed:
             failed = error
