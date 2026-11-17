@@ -42,6 +42,7 @@ INSTALLED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "insta
 UPDATE_FILE = os.path.expanduser("~/.cache/claude-session-deck/update.json")    # see silence_update()
 WINDOWS_FILE = os.path.expanduser("~/.cache/claude-session-deck/windows.json")  # see learn_window()
 PLACES_FILE = os.path.expanduser("~/.cache/claude-session-deck/places.json")    # see Sessions.place()
+PINS_FILE = os.path.expanduser("~/.cache/claude-session-deck/pins.json")        # see Sessions.pin()
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
                            "claude-session-deck")                # sockets of TOOLS and of emulated decks
 ELGATO_VENDOR = 0x0FD9
@@ -2127,6 +2128,76 @@ def find_window(session, chain, title=None):
     return None, None, notes
 
 
+# A free key takes the window that has the focus when the key is held, and
+# brings it back when pressed: a pin, {"backend", "id", "pid", "app", "title"}.
+# While there are pins the desktop is asked for its windows every few seconds,
+# to show a pinned window's title and to drop the pin of one that was closed.
+PIN_INTERVAL = 2             # seconds between these looks
+PIN_COLOR = (80, 200, 210)
+_pinned = threading.Event()  # there are pins, see Sessions
+_seen = None                 # (backend name, {window id: window}) of the last look, None if no backend was usable
+_pin_keys = {}               # what a pin's key was drawn from -> its image
+
+
+def watch_windows():
+    """Keep `_seen` up to date while there are pins; meant to run in a thread of its own."""
+    global _seen
+    while True:
+        _pinned.wait()
+        try:
+            backend, windows, _ = list_windows()
+            seen = (backend.name, {window["id"]: window for window in windows}) if backend else None
+        except Exception as e:  # a backend that answers what is not a list of windows
+            log(f"cannot look at the windows: {e!r}")
+            seen = None
+        if seen != _seen:
+            _seen = seen
+            wake()
+        time.sleep(PIN_INTERVAL)
+
+
+def app_name(window):
+    """A short name for the program a window belongs to."""
+    name = window.get("wm_class") or proc_name(window.get("pid")) or "window"
+    parts = name.split(".")
+    return parts[-1] if re.fullmatch(r"[a-z]{2,3}", parts[0]) else parts[0]  # org.gnome.Nautilus, Mattermost.Desktop
+
+
+def wrap(text, fnt, width, lines):
+    """`text` as at most `lines` lines of `width` pixels, broken at spaces; what does not fit is cut off."""
+    out, words = [], text.split()
+    while words and len(out) < lines:
+        line = words.pop(0)
+        while words and fnt.getlength(f"{line} {words[0]}") <= width:
+            line += " " + words.pop(0)
+        out.append(line)
+    if words:
+        out[-1] += " " + " ".join(words)
+    return [fit(line, fnt, width) for line in out]
+
+
+def pin_key(pin, size):
+    """Image of `size` pixels for the key a window is pinned to."""
+    window = _seen[1].get(pin["id"]) if _seen and _seen[0] == pin["backend"] else None
+    focus = bool(window and window.get("focus"))
+    drawn = (pin["app"], pin["title"], focus, size)
+    if drawn not in _pin_keys:
+        if len(_pin_keys) > STILL_KEYS:
+            _pin_keys.clear()
+        px = scaler(size)
+        img = background(PIN_COLOR, 0.34 if focus else 0.1)
+        ImageDraw.Draw(img).rectangle((0, 0, UNIT * SS, 3 * SS), fill=mix(BASE, PIN_COLOR, 0.95 if focus else 0.5))
+        img = img.resize((size, size), Image.LANCZOS)
+        d = ImageDraw.Draw(img)
+        head, line = font(px(13)), font(px(11), "Condensed Medium")
+        d.text((px(PAD), px(6)), fit(pin["app"], head, name_width(size)), font=head,
+               fill=mix(PIN_COLOR, (255, 255, 255), 0.35))
+        for row, text in enumerate(wrap(pin["title"], line, name_width(size), 3)):
+            d.text((px(PAD), px(23 + 13 * row)), text, font=line, fill=(225, 229, 236) if focus else (175, 181, 192))
+        _pin_keys[drawn] = img
+    return _pin_keys[drawn]
+
+
 # Raising a window works for any terminal or IDE. A tool listed here knows the
 # program a session runs in well enough to do more, such as selecting its tab.
 
@@ -2492,6 +2563,14 @@ class Sessions:
             self.places = {sid: slot for sid, slot in saved.items() if isinstance(slot, int) and slot >= 0}
         except (OSError, ValueError, AttributeError):
             pass
+        self.pins = {}         # key -> the window pinned to it, see pin()
+        try:
+            self.pins = {int(slot): pin for slot, pin in read_json(PINS_FILE).items()
+                         if {"backend", "id", "pid", "app", "title"} <= set(pin)}
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+        if self.pins:
+            _pinned.set()
         self.infos = {}        # session -> key_info() of it
         self.last_status = {}  # session -> status last seen
         self.since = {}        # session -> epoch seconds the status was entered
@@ -2514,6 +2593,7 @@ class Sessions:
         if time.monotonic() - self.started > PLACES_KEPT and not self.places.keys() <= sessions.keys():
             self.places = {sid: slot for sid, slot in self.places.items() if sid in sessions}
             save_json(PLACES_FILE, self.places, "the keys of the sessions")
+        self.check_pins()
         self.arrange()
         self.infos = {}
         for place, sid in enumerate(self.by_age):
@@ -2541,15 +2621,16 @@ class Sessions:
 
     def arrange(self):
         """Give every session a key: one that was put on a key by hand that key, the others the
-        free keys in their order, oldest session first, so that they move up when a session ends."""
+        free keys in their order, oldest session first, so that they move up when a session ends.
+        A key that a window is pinned to is not free."""
         taken = {}
         for sid, slot in list(self.places.items()):
             if sid in self.sessions:
-                if slot in taken:  # only a damaged file says so
+                if slot in taken or slot in self.pins:  # a damaged file, or pinned before the session was found
                     del self.places[sid]
                 else:
                     taken[slot] = sid
-        free = (slot for slot in itertools.count() if slot not in taken)
+        free = (slot for slot in itertools.count() if slot not in taken and slot not in self.pins)
         for sid in self.by_age:
             if sid not in self.places:
                 taken[next(free)] = sid
@@ -2572,17 +2653,71 @@ class Sessions:
         The other sessions fill the free keys as ever, so one that had the key
         moves to the right if the session came from there, else to the left."""
         sid, self.moving = self.moving, None
-        if sid not in self.sessions or not 0 <= slot < room or self.slots[slot:slot + 1] == [sid]:
+        if sid not in self.sessions or not 0 <= slot < room or slot in self.pins \
+                or self.slots[slot:slot + 1] == [sid]:
             return  # nothing is picked up, the key is not for sessions, or it is put down where it was
         self.places.pop(sid, None)
         taken = {at: other for other, at in self.places.items() if other in self.sessions}
         while sid is not None and slot < room:
             self.places[sid] = slot
-            sid, slot = taken.get(slot), slot + 1
+            sid = taken.get(slot)
+            slot = next(after for after in itertools.count(slot + 1) if after not in self.pins)
         if sid is not None:
             del self.places[sid]
         save_json(PLACES_FILE, self.places, "the keys of the sessions")
         self.arrange()
+
+    def pin(self, slot):
+        """Pin the window that has the focus to the free key `slot`. It leaves the key it was pinned to before."""
+        global _seen
+        backend, windows, notes = list_windows()
+        window = next((window for window in windows if window.get("focus")), None)
+        if window is None:
+            log(f"no window has the focus to be pinned ({'; '.join(notes) or 'no usable backend'})")
+            return
+        _seen = (backend.name, {window["id"]: window for window in windows})  # the last look may not have it yet
+        self.pins = {at: pin for at, pin in self.pins.items()
+                     if (pin["backend"], pin["id"]) != (backend.name, window["id"])}
+        self.pins[slot] = {"backend": backend.name, "id": window["id"], "pid": window.get("pid"),
+                           "app": app_name(window), "title": window.get("title") or ""}
+        self.keep_pins()
+
+    def unpin(self, slot):
+        """Make the key `slot` free again."""
+        del self.pins[slot]
+        self.keep_pins()
+
+    def keep_pins(self):
+        save_json(PINS_FILE, {str(slot): pin for slot, pin in self.pins.items()}, "the pinned windows")
+        (_pinned.set if self.pins else _pinned.clear)()
+        self.arrange()
+
+    def check_pins(self):
+        """Take the titles of the pinned windows from the last look at them, and drop the pins of closed ones.
+
+        A window counts as closed only if its desktop listed the others: one
+        that cannot be asked right now may still have it."""
+        closed = []
+        for slot, pin in self.pins.items():
+            if not _seen or _seen[0] != pin["backend"]:
+                continue
+            window = _seen[1].get(pin["id"])
+            if window is None or window.get("pid") != pin["pid"]:  # the same id, but of another program's window
+                closed.append(slot)
+            else:
+                pin["title"] = window.get("title") or ""
+        if closed:
+            self.pins = {slot: pin for slot, pin in self.pins.items() if slot not in closed}
+            self.keep_pins()
+
+    def raise_pin(self, slot):
+        """Give the window pinned to the key `slot` the focus."""
+        pin = self.pins[slot]
+        backend = next((backend for backend in BACKENDS if backend.name == pin["backend"]), None)
+        try:
+            backend.activate(pin["id"])
+        except Exception as e:  # also if there is no such backend any more
+            log(f"cannot focus the pinned window {pin['app']} through {pin['backend']}: {e}")
 
     def visit(self, sid):
         """Jump to a session's window; returns whether there is such a session."""
@@ -2624,6 +2759,8 @@ def show(deck, board, now, frames):
         info = board.infos.get(sid)
         if key == spare:
             image = update_key(size) if update else usage_key(size, now)
+        elif key in board.pins:
+            image = pin_key(board.pins[key], size)
         elif info is None:
             image = target(size) if board.moving else blank(size)
         else:
@@ -2664,8 +2801,14 @@ def act(deck, board, control, value):
         if value == spare and update_shown():  # pressed, the update is installed; held, it is left for later
             (silence_update if control == "hold" else install_update)()
             return False
-        if control == "hold":
-            board.pick(deck.slots[value])
+        if value != spare and value in board.pins:  # pressed, its window gets the focus; held, the key is freed
+            (board.unpin if control == "hold" else board.raise_pin)(value)
+            return False
+        if control == "hold":  # a session is picked up; a free key takes the window that has the focus
+            if deck.slots[value] is None and value != spare:
+                attempt(board.pin, value)
+            else:
+                board.pick(deck.slots[value])
             return False
         return board.visit(deck.slots[value])
     if control == "turn":  # any dial sets the brightness
@@ -2723,6 +2866,7 @@ def main():
     login = Login()
     if USAGE_EVERY:
         threading.Thread(target=ask_usage, daemon=True).start()
+    threading.Thread(target=watch_windows, daemon=True).start()
     if UPDATE_EVERY:
         read_silence()
         threading.Thread(target=watch_updates, daemon=True).start()

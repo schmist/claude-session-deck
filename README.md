@@ -30,6 +30,8 @@ It does:
   JetBrains IDEs and in Ptyxis.
 - Let you [move a session to another key](#moving-a-session): hold its key,
   then press the key it is to be on.
+- [Pin any window](#pinning-a-window) to a free key: hold the key to pin the
+  window that has the focus, press it to get that window back.
 - Drive several decks of different [models](#decks) at once, real or emulated.
 - Tell you when there is a [newer version](#updates), and install it when you
   press the key that says so.
@@ -97,6 +99,27 @@ when Anthropic rates its limit as a warning and red when as critical. The
 figures are five minutes old at most. For accounts without such limits the key
 reads `no data yet`.
 
+### Pinning a window
+
+A free key can stand for any window, not only a session's.
+
+| What you do | What happens |
+|---|---|
+| Hold a free key for 0.6 s | The window that has the focus is pinned to it. The key shows its program and its title |
+| Press the key | The window comes to the front and gets the focus |
+| Hold the key for 0.6 s | The pin is removed and the key is free again |
+
+A pinned key is lit while its window has the focus. A window is on one key
+only: pinned to a second key, it leaves the first. Sessions leave pinned keys
+alone: they fill the free keys around them, and a session that is
+[moved](#moving-a-session) cannot be put on one. When the window is closed,
+the pin goes with it. Pins are the same on every deck and survive a restart
+of the daemon, but not a logout, as the windows do not either.
+
+This uses the same way to [list and raise windows](#jumping-to-a-session) as
+the jump to a session. While there are pins, the daemon asks the desktop for
+its windows every two seconds, to show their titles.
+
 ### Updates
 
 Every five minutes the daemon asks the server of the clone it was installed from
@@ -131,7 +154,7 @@ clone does not look for updates.
 |---|---|
 | A free key | The session is put there. Its old key is filled by the sessions after it moving up |
 | Another session's key | The session takes that key. Coming from further right or below, the session that was there and those after it move on by one key, to the right and into the next row at the end of one. Coming from the left or above, they move up by one instead, as its old key became free |
-| The usage key, or the session's own key | The session is put down where it was |
+| The usage key, a key a window is pinned to, or the session's own key | The session is put down where it was |
 | No key for 10 s | The same |
 
 The usage key in the bottom-right corner never moves and nothing is moved onto
@@ -248,8 +271,8 @@ Of a transcript the daemon keeps the name of the running tool, the token
 counts of the last reply and the model; the conversation itself is not kept,
 shown or logged. What it writes is the window it remembered for each session,
 in `~/.cache/claude-session-deck/windows.json`, the keys you moved sessions
-to, in `places.json` next to it, until when an update is not shown, in
-`update.json` there, and its log.
+to, in `places.json` next to it, the windows you pinned, in `pins.json`,
+until when an update is not shown, in `update.json`, and its log.
 
 These files are internal to Claude Code, so an update can break
 claude-session-deck.
