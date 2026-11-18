@@ -113,8 +113,9 @@ A pinned key is lit while its window has the focus. A window is on one key
 only: pinned to a second key, it leaves the first. Sessions leave pinned keys
 alone: they fill the free keys around them, and a session that is
 [moved](#moving-a-session) cannot be put on one. When the window is closed,
-the pin goes with it. Pins are the same on every deck and survive a restart
-of the daemon, but not a logout, as the windows do not either.
+the pin goes with it, and when its program ends, at once. Pins are the same
+on every deck and survive a restart of the daemon, but not a logout or a
+reboot, as the windows do not either.
 
 This uses the same way to [list and raise windows](#jumping-to-a-session) as
 the jump to a session. While there are pins, the daemon asks the desktop for
@@ -271,8 +272,9 @@ Of a transcript the daemon keeps the name of the running tool, the token
 counts of the last reply and the model; the conversation itself is not kept,
 shown or logged. What it writes is the window it remembered for each session,
 in `~/.cache/claude-session-deck/windows.json`, the keys you moved sessions
-to, in `places.json` next to it, the windows you pinned, in `pins.json`,
-until when an update is not shown, in `update.json`, and its log.
+to, in `places.json` next to it, until when an update is not shown, in
+`update.json`, the windows you pinned, in
+`$XDG_RUNTIME_DIR/claude-session-deck/pins.json`, and its log.
 
 These files are internal to Claude Code, so an update can break
 claude-session-deck.

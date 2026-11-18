@@ -42,9 +42,9 @@ INSTALLED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "insta
 UPDATE_FILE = os.path.expanduser("~/.cache/claude-session-deck/update.json")    # see silence_update()
 WINDOWS_FILE = os.path.expanduser("~/.cache/claude-session-deck/windows.json")  # see learn_window()
 PLACES_FILE = os.path.expanduser("~/.cache/claude-session-deck/places.json")    # see Sessions.place()
-PINS_FILE = os.path.expanduser("~/.cache/claude-session-deck/pins.json")        # see Sessions.pin()
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
                            "claude-session-deck")                # sockets of TOOLS and of emulated decks
+PINS_FILE = os.path.join(RUNTIME_DIR, "pins.json")  # see Sessions.pin(); gone with the login, as its windows
 ELGATO_VENDOR = 0x0FD9
 UNIT = 72                   # key size in pixels that the drawing is laid out for; other sizes are scaled from it
 BRIGHTNESS = 60             # percent
@@ -2129,7 +2129,7 @@ def find_window(session, chain, title=None):
 
 
 # A free key takes the window that has the focus when the key is held, and
-# brings it back when pressed: a pin, {"backend", "id", "pid", "app", "title"}.
+# brings it back when pressed: a pin, {"backend", "id", "pid", "start", "app", "title"}.
 # While there are pins the desktop is asked for its windows every few seconds,
 # to show a pinned window's title and to drop the pin of one that was closed.
 PIN_INTERVAL = 2             # seconds between these looks
@@ -2566,7 +2566,7 @@ class Sessions:
         self.pins = {}         # key -> the window pinned to it, see pin()
         try:
             self.pins = {int(slot): pin for slot, pin in read_json(PINS_FILE).items()
-                         if {"backend", "id", "pid", "app", "title"} <= set(pin)}
+                         if {"backend", "id", "pid", "start", "app", "title"} <= set(pin)}
         except (OSError, ValueError, AttributeError, TypeError):
             pass
         if self.pins:
@@ -2678,7 +2678,8 @@ class Sessions:
         _seen = (backend.name, {window["id"]: window for window in windows})  # the last look may not have it yet
         self.pins = {at: pin for at, pin in self.pins.items()
                      if (pin["backend"], pin["id"]) != (backend.name, window["id"])}
-        self.pins[slot] = {"backend": backend.name, "id": window["id"], "pid": window.get("pid"),
+        pid = window.get("pid")
+        self.pins[slot] = {"backend": backend.name, "id": window["id"], "pid": pid, "start": pid and proc_start(pid),
                            "app": app_name(window), "title": window.get("title") or ""}
         self.keep_pins()
 
@@ -2695,10 +2696,14 @@ class Sessions:
     def check_pins(self):
         """Take the titles of the pinned windows from the last look at them, and drop the pins of closed ones.
 
-        A window counts as closed only if its desktop listed the others: one
-        that cannot be asked right now may still have it."""
+        A window is closed when its program no longer runs. Otherwise it counts
+        as closed only if its desktop listed the others: one that cannot be
+        asked right now may still have it."""
         closed = []
         for slot, pin in self.pins.items():
+            if pin["pid"] and proc_start(pin["pid"]) != pin["start"]:  # the program ended, the pid may be another's
+                closed.append(slot)
+                continue
             if not _seen or _seen[0] != pin["backend"]:
                 continue
             window = _seen[1].get(pin["id"])
