@@ -206,11 +206,25 @@ fi
 
 # --- JetBrains IDEs: select the session's terminal tab ------------------------
 # The plugin is built against each IDE found, by Gradle running on the Java that IDE ships.
-# build_plugin <IDE home> <plugins directory>
+# That takes a while, so it is built again only when its sources or the IDE changed.
+# plugin_stamp <IDE home>: what the plugin is built from, as one line
+plugin_stamp() {
+    local sources
+    sources=$(cd "$here/jetbrains-plugin" &&
+        find . \( -name .gradle -o -name .intellijPlatform -o -name .kotlin -o -name build \) -prune \
+            -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum)
+    echo "${sources%% *} $1 $(cat "$1/build.txt" 2>/dev/null || stat -c %Y "$1/product-info.json")"
+}
+
+# build_plugin <IDE home> <plugins directory>: fails with 2 if the plugin is up to date
 build_plugin() (
-    cd "$here/jetbrains-plugin"
+    local stamp_file="$2/claude-session-deck/.built-from" stamp
+    stamp=$(plugin_stamp "$1")
+    [ "$(cat "$stamp_file" 2>/dev/null)" != "$stamp" ] || exit 2  # up to date
+    cd "$here/jetbrains-plugin" || exit 1  # each step, as set -e does not hold in a function called with ||
     [ ! -x "$1/jbr/bin/java" ] || export JAVA_HOME="$1/jbr"
-    ./gradlew --quiet installPlugin -Pide="$1" -Pplugins="$2"
+    ./gradlew --quiet installPlugin -Pide="$1" -Pplugins="$2" || exit 1
+    echo "$stamp" > "$stamp_file"  # after the build, as installPlugin empties the folder
 )
 
 jetbrains_homes() {
@@ -232,9 +246,11 @@ print(info["productVendor"] + "/" + info["dataDirectoryName"], info["name"])' "$
     plugins_dir="${XDG_DATA_HOME:-$HOME/.local/share}/$ide_data"
     if [ -e "$plugins_dir/claude-session-deck" ] ||
         ask "Select the session's terminal tab in $ide_name? This builds a plugin and installs it to $plugins_dir"; then
-        if build_plugin "$ide_home" "$plugins_dir"; then
+        built=0
+        build_plugin "$ide_home" "$plugins_dir" || built=$?
+        if [ "$built" -eq 0 ]; then
             jetbrains_ides+="${jetbrains_ides:+, }$ide_name"
-        else
+        elif [ "$built" -ne 2 ]; then
             warn "could not build the plugin for $ide_name: its terminal may be too old, or Gradle could not download what it needs"
         fi
     fi
