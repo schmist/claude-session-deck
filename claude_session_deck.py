@@ -857,6 +857,11 @@ def background(accent, tint):
                            Image.new("RGB", (big, big), BASE), _gradient)
 
 
+def pill(g, box, radius, fill):
+    """Draws a rounded bar on whole pixels: Pillow 10.2 raises on some fractional widths just above twice the radius."""
+    g.rounded_rectangle(tuple(round(v) for v in box), radius, fill=fill)
+
+
 def level_color(used, normal):
     """Colour of a bar that is `used` (0..1) full: amber and red warn that it fills up."""
     return (255, 80, 80) if used > 0.85 else (255, 190, 70) if used > 0.65 else normal
@@ -1130,10 +1135,10 @@ def draw_key(info, t, name, shift, size):
         if info["tokens"]:  # the bar ends where the number next to it starts
             x2 = (UNIT - PAD - small.getlength(info["tokens"]) * UNIT / size - 4) * SS
             box = (PAD * SS, (bar_y - 2) * SS, x2, (bar_y + 2) * SS)
-            g.rounded_rectangle(box, 2 * SS, fill=TRACK)
+            pill(g, box, 2 * SS, TRACK)
             used = min(1.0, info["context"])
-            g.rounded_rectangle((box[0], box[1], box[0] + max(4 * SS, (x2 - box[0]) * used), box[3]),
-                                2 * SS, fill=level_color(used, (165, 172, 185)))
+            pill(g, (box[0], box[1], box[0] + max(4 * SS, (x2 - box[0]) * used), box[3]),
+                 2 * SS, level_color(used, (165, 172, 185)))
     img = img.resize((size, size), Image.LANCZOS)
 
     # --- text, at the key's size ----------------------------------------------
@@ -1271,9 +1276,9 @@ def render_usage(size=UNIT):
     base, bar, sizes = (11, (13, 17), (10, 9, 13)) if len(windows) > 2 else (13, (16, 21), (11, 10, 15))
     for y, (_, used, _, severity) in zip(rows, windows):
         box = (PAD * SS, (y + bar[0]) * SS, (UNIT - PAD) * SS, (y + bar[1]) * SS)
-        g.rounded_rectangle(box, 2.5 * SS, fill=TRACK)
-        g.rounded_rectangle((box[0], box[1], box[0] + max(5 * SS, (box[2] - box[0]) * min(1, used)),
-                             box[3]), 2.5 * SS, fill=usage_color(used, severity))
+        pill(g, box, 2.5 * SS, TRACK)
+        pill(g, (box[0], box[1], box[0] + max(5 * SS, (box[2] - box[0]) * min(1, used)), box[3]),
+             2.5 * SS, usage_color(used, severity))
     img = img.resize((size, size), Image.LANCZOS)
     d = ImageDraw.Draw(img)
     dim = (150, 156, 168)
@@ -1360,9 +1365,9 @@ def draw_panels(size, counts, windows):
         for row, (name, used, left, severity) in enumerate(windows):
             y = top + row * pitch
             box = ((x + 12) * SS, (y + bar[0]) * SS, (x + pw - 12) * SS, (y + bar[1]) * SS)
-            g.rounded_rectangle(box, (bar[1] - bar[0]) / 2 * SS, fill=TRACK)
-            g.rounded_rectangle((box[0], box[1], box[0] + max(7 * SS, (box[2] - box[0]) * min(1, used)),
-                                 box[3]), (bar[1] - bar[0]) / 2 * SS, fill=usage_color(used, severity))
+            pill(g, box, (bar[1] - bar[0]) / 2 * SS, TRACK)
+            pill(g, (box[0], box[1], box[0] + max(7 * SS, (box[2] - box[0]) * min(1, used)), box[3]),
+                 (bar[1] - bar[0]) / 2 * SS, usage_color(used, severity))
             texts.append(((x + 12, y + base), name, font(sizes[0]), white, "ls"))
             texts.append(((x + 12 + font(sizes[0]).getlength(name) + 5, y + base), fmt_reset(left),
                           font(sizes[1], "Condensed Medium"), dim, "ls"))
@@ -1395,9 +1400,9 @@ def draw_compact(size, counts, windows):
         for row, (name, used, _, severity) in enumerate(windows):
             y = (5 if rows == 2 else 0) + row * (h - 6) // rows
             box = (left_edge * SS, (y + 14) * SS, right_edge * SS, (y + (18 if rows == 2 else 17)) * SS)
-            g.rounded_rectangle(box, 2 * SS, fill=TRACK)
-            g.rounded_rectangle((box[0], box[1], box[0] + max(4 * SS, (box[2] - box[0]) * min(1, used)),
-                                 box[3]), 2 * SS, fill=usage_color(used, severity))
+            pill(g, box, 2 * SS, TRACK)
+            pill(g, (box[0], box[1], box[0] + max(4 * SS, (box[2] - box[0]) * min(1, used)), box[3]),
+                 2 * SS, usage_color(used, severity))
             texts.append(((left_edge, y + 11), name, font(11), white, "ls"))
             texts.append(((right_edge, y + 11), f"{round(used * 100)}%", font(12), white, "rs"))
         return texts
